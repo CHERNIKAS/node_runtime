@@ -242,6 +242,22 @@ disable_ufw() {
   systemctl mask ufw 2>/dev/null || true
 }
 
+configure_colored_prompt() {
+  # Adds a coloured PS1 to /root/.bashrc so the hostname stands out
+  # in SSH sessions (operators flag this constantly when juggling 5+ nodes).
+  # Bright green (\033[01;32m) hostname, bright blue (\033[01;34m) cwd.
+  log "Setting up coloured root prompt"
+  local bashrc="/root/.bashrc"
+  if [ -f "$bashrc" ] && grep -q "NETRUN colored prompt" "$bashrc"; then
+    return 0  # Already installed
+  fi
+  cat >> "$bashrc" <<'EOF'
+
+# === NETRUN colored prompt — bright green hostname for visual ID ===
+export PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+EOF
+}
+
 pin_dns_resolvers() {
   log "Pinning /etc/resolv.conf to public resolvers (Vultr regional DNS unreliable per-DC)"
   # Remove immutable flag if set from prior runs
@@ -521,6 +537,7 @@ main() {
   disable_ufw
   pin_dns_resolvers
   configure_file_limits
+  configure_colored_prompt
 
   install_os_dependencies
   install_nodejs_20_if_needed
