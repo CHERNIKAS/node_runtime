@@ -150,12 +150,14 @@ ENROLL_RESPONSE=$(curl -fsS -X POST "$ORCH_URL/v1/nodes/enroll" \
   -H "Content-Type: application/json" \
   -d "$ENROLL_PAYLOAD" 2>&1) || die "enrollment failed: $ENROLL_RESPONSE"
 
-NODE_ID=$(echo "$ENROLL_RESPONSE" | jq -r '.id // .node_id // empty')
+NODE_ID=$(echo "$ENROLL_RESPONSE" | jq -r '.node.id // .id // .node_id // empty')
 [ -z "$NODE_ID" ] && {
   echo "$ENROLL_RESPONSE" | jq .
   die "enrollment response missing node id"
 }
-ok "registered: node_id=$NODE_ID (auto-bound to ipv6_$(echo "$GEO" | tr '[:upper:]' '[:lower:]') SKU if present)"
+AUTO_BOUND=$(echo "$ENROLL_RESPONSE" | jq -r '.auto_bound_skus // [] | join(", ")')
+ok "registered: node_id=$NODE_ID"
+[ -n "$AUTO_BOUND" ] && ok "auto-bound SKUs: $AUTO_BOUND"
 
 # === 6. Doctor check + summary ===
 log "6/6 Running netrun-doctor.sh"
