@@ -284,12 +284,22 @@ ensure_legacy_root_proxyserver_symlink() {
 install_systemd_service() {
   local template="$NETRUN_HOME/deploy/node/netrun-node-agent.service.template"
   [ -f "$template" ] || die "service_template_not_found: $template"
-  log "Installing systemd service (v2: with raised limits)"
+  log "Installing systemd service (v2: with drop-in raised limits)"
   install -m 0644 "$template" "$SERVICE_FILE"
-  # Insert raised limits into [Service] block if not already there
-  if ! grep -q "TasksMax=infinity" "$SERVICE_FILE"; then
-    sed -i '/^\[Service\]/a TasksMax=infinity\nLimitNOFILE=1048576\nLimitNPROC=infinity' "$SERVICE_FILE"
-  fi
+
+  # v2 fix: use drop-in override instead of sed-injecting into the unit.
+  # Earlier sed approach used `\n` in the replacement string, which GNU sed
+  # interprets as literal `\n` (not a newline) unless under `s///`. The result
+  # was a single garbled line that didn't set TasksMax. Drop-ins are also the
+  # systemd-recommended way to override unit settings.
+  mkdir -p "${SERVICE_FILE}.d"
+  cat > "${SERVICE_FILE}.d/99-netrun-limits.conf" <<'EOF'
+[Service]
+TasksMax=infinity
+LimitNOFILE=1048576
+LimitNPROC=infinity
+EOF
+
   systemctl daemon-reload
   systemctl enable "$SERVICE_NAME" >/dev/null
   systemctl restart "$SERVICE_NAME"
