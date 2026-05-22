@@ -19,19 +19,30 @@
 
 ## 1. Установка ноды с нуля
 
+**✅ ПРОВЕРЕНО БОЕМ 2026-05-22** на свежей reinstalled Vultr Ubuntu 24.04 (Tokyo) — ставится одной командой до ALL GREEN. Запускать **с orchestrator** (host key чистится автоматически):
+
 ```bash
-cd /root
-rm -rf node_runtime_new
-git clone https://github.com/Tmwyw/node_runtime_new.git
+ssh-keygen -R <NODE_IP> 2>/dev/null
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@<NODE_IP> 'bash -s' <<'REMOTE'
+set -e
+cd /root && rm -rf node_runtime_new
+git clone -q https://github.com/Tmwyw/node_runtime_new.git
 cd node_runtime_new
+grep -q "nft flush ruleset" install_node_v2.sh || { echo "OLD repo — push fix"; exit 1; }
 chmod +x install_node_v2.sh scripts/*.sh
-
-# Полная установка (clean + remove legacy /root/proxyserver)
 bash install_node_v2.sh --clean --remove-legacy-root
-
-# Watchdog v3 (restart-then-reboot) + анти-MLD sysctl
 bash scripts/node_followup_v2.sh
+# финальный self-check
+for k in "/health:$(curl -s -m5 -o/dev/null -w%{http_code} http://127.0.0.1:8085/health)" \
+         "agent:$(systemctl is-active netrun-node-agent)" "nftables:$(systemctl is-active nftables)" \
+         "TasksMax:$(systemctl show netrun-node-agent -p TasksMax --value)" \
+         "symlink:$(readlink /root/proxyserver)" "watchdog:$(systemctl is-active netrun-watchdog.timer)"; do echo "  $k"; done
+REMOTE
 ```
+
+Эталон: `/health:200 agent:active nftables:active TasksMax:infinity symlink:/opt/netrun/proxyserver watchdog:active`.
+
+> **Баг свежих нод (исправлен 2026-05-22):** Ubuntu 24.04 идёт с UFW, чьи правила в nftables используют xtables-compat (`xt match "icmp6"`). После `apt purge ufw` они остаются в live-ruleset; `nft list ruleset > /etc/nftables.conf` записывал их, и `systemctl start nftables` падал → install прерывался. Фикс: `configure_nftables` делает `nft flush ruleset` перед записью конфига. На старых нодах не проявлялось (ufw давно вычищен).
 
 ### Что делает `install_node_v2.sh`
 
