@@ -180,11 +180,24 @@ net.core.somaxconn = 8192
 net.ipv4.ip_local_port_range = 10000 65000
 fs.file-max = 2097152
 
+# === TCP/IP fingerprint normalization (Android-like) ===
+# tcp_timestamps=1: Linux/Android default. =0 makes p0f read OS as Windows.
+# tcp_mtu_probing=1: PLPMTUD — discovers PMTU dynamically; safer than fixed
+# MSS-clamp (which produced MTU=1380 → p0f classified link as OpenVPN).
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_mtu_probing = 1
+
 # === IPv6 multi-homed ===
 net.ipv6.conf.all.accept_ra = 2
 net.ipv6.conf.default.accept_ra = 2
 EOF
+  # Strip any legacy tcp_timestamps line from /etc/sysctl.conf — old generator
+  # wrote =0 there, which is processed AFTER sysctl.d and would override our =1.
+  if [ -f /etc/sysctl.conf ]; then
+    sed -i -E '/^[[:space:]]*net\.ipv4\.tcp_timestamps[[:space:]]*=/d' /etc/sysctl.conf || true
+  fi
   # Tolerate "cannot stat" warnings (e.g. if a netfilter key still not exposed)
+  sysctl --system >/dev/null 2>&1 || true
   sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" || true
 }
 
@@ -259,7 +272,11 @@ configure_nftables() {
   nft add table inet proxy_accounting 2>/dev/null || true
   nft add chain inet proxy_accounting input '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
   nft add chain inet proxy_accounting output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true
-  nft add rule inet proxy_normalization output meta l4proto tcp tcp flags syn tcp option maxseg size set 1340 2>/dev/null || true
+  # MSS clamp 1460 (NOT 1340). Previous 1340 produced effective MTU=1380 which
+  # p0f classified as OpenVPN UDP link. 1460 = standard Ethernet MSS for MTU
+  # 1500 (Android default). PMTU edge cases are handled by tcp_mtu_probing=1
+  # in configure_sysctl above. (Incident 2026-05-23: TCP/IP fingerprint = Win+VPN)
+  nft add rule inet proxy_normalization output meta l4proto tcp tcp flags syn tcp option maxseg size set 1460 2>/dev/null || true
   # Now ruleset has ONLY our tables (no xt-compat) → valid for nft -f on boot
   nft list ruleset > /etc/nftables.conf
   systemctl restart nftables 2>/dev/null || systemctl start nftables 2>/dev/null || true
