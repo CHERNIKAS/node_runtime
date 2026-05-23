@@ -530,65 +530,31 @@ function detect_country_code_by_ip() {
   return 1
 }
 
-function fetch_dns_servers_by_country() {
-  local country_code_lower=$(echo "$1" | tr '[:upper:]' '[:lower:]')
-  local list_url="https://public-dns.info/nameserver/${country_code_lower}.txt"
-
-  if ! command -v curl &> /dev/null; then install_package "curl"; fi;
-
-  curl -4 -sS --max-time 12 "$list_url" 2>/dev/null \
-    | tr -d '\r' \
-    | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/' \
-    | awk -F'.' '$1<=255 && $2<=255 && $3<=255 && $4<=255' \
-    | awk '!seen[$0]++'
-}
-
-function fetch_system_dns_servers() {
-  local collected=""
-  local from_resolvectl=""
-  local from_resolvconf=""
-
-  if command -v resolvectl &> /dev/null; then
-    from_resolvectl=$(resolvectl dns 2>/dev/null \
-      | tr -d '\r' \
-      | tr ' ' '\n' \
-      | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/' \
-      | awk -F'.' '$1<=255 && $2<=255 && $3<=255 && $4<=255' \
-      | awk '!seen[$0]++')
-  fi;
-
-  if [ -f /etc/resolv.conf ]; then
-    from_resolvconf=$(awk '/^nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf \
-      | tr -d '\r' \
-      | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/' \
-      | awk -F'.' '$1<=255 && $2<=255 && $3<=255 && $4<=255' \
-      | awk '!seen[$0]++')
-  fi;
-
-  collected=$(printf "%s\n%s\n" "$from_resolvectl" "$from_resolvconf" | awk 'NF && !seen[$0]++')
-  echo "$collected"
-}
-
-function is_dns_server_usable() {
-  local dns_ip="$1"
-  local ipv4_answer=""
-  local ipv6_answer=""
-
-  if ! command -v dig &> /dev/null; then install_package "dnsutils"; fi;
-
-  ipv4_answer=$(dig +time=2 +tries=1 +short @"$dns_ip" api.ipify.org A 2>/dev/null | head -n 1 | tr -d '\r\n ')
-  ipv6_answer=$(dig +time=2 +tries=1 +short @"$dns_ip" api64.ipify.org AAAA 2>/dev/null | head -n 1 | tr -d '\r\n ')
-
-  if is_valid_ip "$ipv4_answer" && looks_like_ipv6 "$ipv6_answer"; then return 0; fi;
+function locate_dns_seed() {
+  # Stdout: absolute path to bundled dns/seed.json, or empty if not found.
+  local script_dir=""
+  script_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" 2>/dev/null && pwd -P 2>/dev/null) || script_dir=""
+  local candidates=(
+    "${NETRUN_HOME:-/opt/netrun}/dns/seed.json"
+    "/opt/netrun/dns/seed.json"
+    "${script_dir}/../../dns/seed.json"
+    "${script_dir}/../../../dns/seed.json"
+  )
+  local p=""
+  for p in "${candidates[@]}"; do
+    if [ -n "$p" ] && [ -f "$p" ]; then echo "$p"; return 0; fi;
+  done
   return 1
 }
 
 function configure_dns_servers() {
+  # --- Manual override (accepts IPv4 OR IPv6 for each of the two slots) ---
   if [ -n "$dns_servers_override" ]; then
     IFS=',' read -r dns_override_1 dns_override_2 _ <<< "$dns_servers_override"
     dns_override_1=$(echo "$dns_override_1" | tr -d '[:space:]')
     dns_override_2=$(echo "$dns_override_2" | tr -d '[:space:]')
-    if is_valid_ip "$dns_override_1" && is_valid_ip "$dns_override_2"; then
+    if { is_valid_ip "$dns_override_1" || looks_like_ipv6 "$dns_override_1"; } \
+       && { is_valid_ip "$dns_override_2" || looks_like_ipv6 "$dns_override_2"; }; then
       dns_nserver_lines="  nserver ${dns_override_1}"$'\n'"  nserver ${dns_override_2}"
       dns_selected_country="manual"
       dns_selected_servers_csv="${dns_override_1},${dns_override_2}"
@@ -596,152 +562,90 @@ function configure_dns_servers() {
       echo "   DNS selected (manual_override): ${dns_selected_servers_csv}"
       return
     else
-      log_err_print_usage_and_exit "Error: '--dns-servers' must contain two IPv4 resolvers as 'ip1,ip2'";
+      log_err_print_usage_and_exit "Error: '--dns-servers' must contain two valid IPv4 or IPv6 resolvers as 'ip1,ip2'";
     fi;
   fi;
 
+  # --- Resolve country code (uppercase) ---
   local resolved_country="$dns_country"
-  local dns_candidates=""
-  local system_dns_candidates=""
-  local selected_dns=()
-  local candidate_dns=()
-  local selected_sources=()
-  local preferred_dns_pool=("8.8.8.8" "1.1.1.1" "9.9.9.9" "208.67.222.222" "208.67.220.220" "64.6.64.6" "64.6.65.6" "156.154.70.1")
-  local max_country_candidates_to_scan=30
-  local max_system_candidates_to_scan=8
-  local source=""
-  local dns_ip=""
-  local scanned_count=0
-  local is_global_preferred=false
-  local -A seen_dns=()
-  local -A dns_source_by_ip=()
-
-  dns_selected_country="fallback"
-  dns_selected_servers_csv="1.1.1.1,8.8.8.8"
-  dns_selection_strategy="fallback_global"
-  dns_nserver_lines=$'  nserver 1.1.1.1\n  nserver 8.8.8.8'
-
   if [ "$resolved_country" = "auto" ]; then
     resolved_country=$(detect_country_code_by_ip "$backconnect_ipv4" || true)
+  fi;
+  resolved_country=$(echo "$resolved_country" | tr '[:lower:]' '[:upper:]')
+  echo "   Country for DNS selection: ${resolved_country:-unknown}"
+
+  # --- Hardcoded last-resort fallback (Quad9 + Cisco OpenDNS anycast). ---
+  # Used ONLY if seed.json is missing or jq is not installed; otherwise the
+  # `global` tier comes from the seed (same IPs, but data-driven).
+  local -a hardcoded_global_v4=("9.9.9.9" "149.112.112.112" "208.67.222.222" "208.67.220.220")
+
+  # --- Locate bundled seed (built by dns/build_seed.py, Phase 2a) ---
+  local seed_path=""
+  seed_path=$(locate_dns_seed || true)
+
+  local -a country_pool=() continent_pool=() global_pool=()
+  local resolved_continent=""
+
+  if [ -n "$seed_path" ] && command -v jq >/dev/null 2>&1; then
+    if [[ "$resolved_country" =~ ^[A-Z]{2}$ ]]; then
+      mapfile -t country_pool < <(jq -r --arg cc "$resolved_country" \
+        '.countries[$cc].v4 // [] | .[]' "$seed_path" 2>/dev/null)
+      resolved_continent=$(jq -r --arg cc "$resolved_country" \
+        '.country_to_continent[$cc] // ""' "$seed_path" 2>/dev/null \
+        | tr '[:lower:]' '[:upper:]')
+    fi;
+    if [[ "$resolved_continent" =~ ^[A-Z]{2}$ ]]; then
+      mapfile -t continent_pool < <(jq -r --arg kc "$resolved_continent" \
+        '.continents[$kc].v4 // [] | .[]' "$seed_path" 2>/dev/null)
+    fi;
+    mapfile -t global_pool < <(jq -r '.global.v4 // [] | .[]' "$seed_path" 2>/dev/null)
   else
-    resolved_country=$(echo "$resolved_country" | tr '[:lower:]' '[:upper:]')
+    echo "   WARNING: seed.json not found or jq missing (path=${seed_path:-none}) — using hardcoded global fallback"
   fi;
 
-  echo "   Country for DNS auto-select: ${resolved_country:-unknown}"
+  # Backfill global tier from hardcoded list if seed had no global entries.
+  if [ ${#global_pool[@]} -eq 0 ]; then global_pool=("${hardcoded_global_v4[@]}"); fi;
 
-  if [[ "$resolved_country" =~ ^[A-Z]{2}$ ]]; then
-    dns_candidates=$(fetch_dns_servers_by_country "$resolved_country" || true)
-  fi;
-  system_dns_candidates=$(fetch_system_dns_servers || true)
-
-  if [ "$dns_country" = "auto" ]; then
-    # AUTO mode: prefer resolvers that are native for this server network first.
-    if [ -n "$system_dns_candidates" ]; then
-      scanned_count=0
-      while IFS= read -r dns_ip; do
-        if [ -z "$dns_ip" ]; then continue; fi;
-        if [[ -n "${seen_dns[$dns_ip]+x}" ]]; then continue; fi;
-        candidate_dns+=("$dns_ip")
-        seen_dns["$dns_ip"]=1
-        dns_source_by_ip["$dns_ip"]="system"
-        scanned_count=$((scanned_count + 1))
-        if [ $scanned_count -ge $max_system_candidates_to_scan ]; then break; fi;
-      done <<< "$system_dns_candidates"
-    fi;
-
-    if [ -n "$dns_candidates" ]; then
-      scanned_count=0
-      while IFS= read -r dns_ip; do
-        if [ -z "$dns_ip" ]; then continue; fi;
-        is_global_preferred=false
-        for preferred_dns in "${preferred_dns_pool[@]}"; do
-          if [ "$dns_ip" = "$preferred_dns" ]; then
-            is_global_preferred=true
-            break
-          fi;
-        done
-        if [ "$is_global_preferred" = true ]; then continue; fi;
-        if [[ -n "${seen_dns[$dns_ip]+x}" ]]; then continue; fi;
-        candidate_dns+=("$dns_ip")
-        seen_dns["$dns_ip"]=1
-        dns_source_by_ip["$dns_ip"]="country"
-        scanned_count=$((scanned_count + 1))
-        if [ $scanned_count -ge $max_country_candidates_to_scan ]; then break; fi;
-      done <<< "$dns_candidates"
-    fi;
+  # Cascade: country (if ≥2) → country+continent (if combined ≥2) → +global.
+  local strategy=""
+  local -a candidates=()
+  if [ ${#country_pool[@]} -ge 2 ]; then
+    candidates=("${country_pool[@]}")
+    strategy="country"
+  elif [ $(( ${#country_pool[@]} + ${#continent_pool[@]} )) -ge 2 ]; then
+    candidates=("${country_pool[@]}" "${continent_pool[@]}")
+    strategy="continent"
   else
-    # Forced country mode: prioritize country feed first, then system DNS.
-    if [ -n "$dns_candidates" ]; then
-      scanned_count=0
-      while IFS= read -r dns_ip; do
-        if [ -z "$dns_ip" ]; then continue; fi;
-        is_global_preferred=false
-        for preferred_dns in "${preferred_dns_pool[@]}"; do
-          if [ "$dns_ip" = "$preferred_dns" ]; then
-            is_global_preferred=true
-            break
-          fi;
-        done
-        if [ "$is_global_preferred" = true ]; then continue; fi;
-        if [[ -n "${seen_dns[$dns_ip]+x}" ]]; then continue; fi;
-        candidate_dns+=("$dns_ip")
-        seen_dns["$dns_ip"]=1
-        dns_source_by_ip["$dns_ip"]="country"
-        scanned_count=$((scanned_count + 1))
-        if [ $scanned_count -ge $max_country_candidates_to_scan ]; then break; fi;
-      done <<< "$dns_candidates"
-    fi;
-
-    if [ -n "$system_dns_candidates" ]; then
-      scanned_count=0
-      while IFS= read -r dns_ip; do
-        if [ -z "$dns_ip" ]; then continue; fi;
-        if [[ -n "${seen_dns[$dns_ip]+x}" ]]; then continue; fi;
-        candidate_dns+=("$dns_ip")
-        seen_dns["$dns_ip"]=1
-        dns_source_by_ip["$dns_ip"]="system"
-        scanned_count=$((scanned_count + 1))
-        if [ $scanned_count -ge $max_system_candidates_to_scan ]; then break; fi;
-      done <<< "$system_dns_candidates"
-    fi;
+    candidates=("${country_pool[@]}" "${continent_pool[@]}" "${global_pool[@]}")
+    strategy="global"
   fi;
 
-  # Add global stable resolvers as final fallback choices.
-  for preferred_dns in "${preferred_dns_pool[@]}"; do
-    if [[ -n "${seen_dns[$preferred_dns]+x}" ]]; then continue; fi;
-    candidate_dns+=("$preferred_dns")
-    seen_dns["$preferred_dns"]=1
-    dns_source_by_ip["$preferred_dns"]="global"
-  done
-
-  # Select first two resolvers that are actually usable from this server.
-  for dns_ip in "${candidate_dns[@]}"; do
-    if is_dns_server_usable "$dns_ip"; then
-      selected_dns+=("$dns_ip")
-      source="${dns_source_by_ip[$dns_ip]}"
-      if [ -z "$source" ]; then source="unknown"; fi;
-      selected_sources+=("$source")
-    fi;
-    if [ ${#selected_dns[@]} -ge 2 ]; then break; fi;
-  done
-
-  if [ ${#selected_dns[@]} -lt 2 ]; then
-    echo "   WARNING: DNS auto-selection did not find 2 stable resolvers (country=${resolved_country:-unknown}), using fallback: 1.1.1.1, 8.8.8.8"
-    return
+  # Defensive — should never trigger because global_pool always has ≥2.
+  if [ ${#candidates[@]} -lt 2 ]; then
+    candidates=("${hardcoded_global_v4[@]}")
+    strategy="hardcoded_fallback"
   fi;
 
-  dns_nserver_lines="  nserver ${selected_dns[0]}"$'\n'"  nserver ${selected_dns[1]}"
+  # --- Deterministic rotation by instance_id (== start_port of this batch) ---
+  # Different refill batches on the same node pick different pairs, so the
+  # resolver mix per port-range varies (anti-pool-fingerprint). Country is
+  # mixed into the hash so refills for different geos don't collide.
+  local total=${#candidates[@]}
+  local hash_seed=0
+  hash_seed=$(printf '%s' "rot:${instance_id}:${resolved_country:-XX}" | cksum | awk '{print $1}')
+  local off1=$(( hash_seed % total ))
+  local off2=$(( (hash_seed + 1) % total ))
+  if [ "$off1" = "$off2" ] && [ "$total" -gt 1 ]; then off2=$(( (off1 + 1) % total )); fi;
+
+  local pick1="${candidates[$off1]}"
+  local pick2="${candidates[$off2]}"
+
+  dns_nserver_lines="  nserver ${pick1}"$'\n'"  nserver ${pick2}"
   dns_selected_country="${resolved_country:-fallback}"
-  dns_selected_servers_csv="${selected_dns[0]},${selected_dns[1]}"
-  if [[ " ${selected_sources[*]} " == *" country "* ]]; then
-    dns_selection_strategy="country_feed"
-  elif [[ " ${selected_sources[*]} " == *" system "* ]]; then
-    dns_selection_strategy="system_resolvers"
-  else
-    dns_selection_strategy="global_fallback"
-  fi;
+  dns_selected_servers_csv="${pick1},${pick2}"
+  dns_selection_strategy="seed_${strategy}"
 
-  echo "   DNS selected (${dns_selected_country}, ${dns_selection_strategy}): ${dns_selected_servers_csv}"
+  echo "   DNS selected (${dns_selected_country}, ${dns_selection_strategy}, instance_id=${instance_id}): ${dns_selected_servers_csv}"
 }
 
 function get_backconnect_ipv4() {

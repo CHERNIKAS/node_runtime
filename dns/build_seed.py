@@ -236,6 +236,7 @@ def build_seed(directory: dict) -> tuple[dict, dict]:
 
     by_country: dict[str, list[dict]] = {}
     by_continent: dict[str, list[dict]] = {}
+    country_to_continent: dict[str, str] = {}
     for r in resolvers:
         cc = (r.get("country_code") or "").upper()
         kc = (r.get("continent_code") or "").upper()
@@ -243,6 +244,8 @@ def build_seed(directory: dict) -> tuple[dict, dict]:
             by_country.setdefault(cc, []).append(r)
         if kc:
             by_continent.setdefault(kc, []).append(r)
+        if cc and kc and cc not in country_to_continent:
+            country_to_continent[cc] = kc
 
     countries_out: dict[str, dict] = {}
     no_local_v4: list[str] = []      # countries falling through to continent/global
@@ -282,6 +285,7 @@ def build_seed(directory: dict) -> tuple[dict, dict]:
         },
         "countries": countries_out,
         "continents": continents_out,
+        "country_to_continent": dict(sorted(country_to_continent.items())),
         "global": GLOBAL_FALLBACK,
     }
     stats = {
