@@ -82,9 +82,9 @@ ipv6_policy="strict_dual_stack"
 proxy_maxconn=200
 proxy_count=1
 dns_selected_country="fallback"
-dns_selected_servers_csv="1.1.1.1,8.8.8.8"
+dns_selected_servers_csv="9.9.9.9,149.112.112.112"
 dns_selection_strategy="fallback_global"
-dns_nserver_lines=$'  nserver 1.1.1.1\n  nserver 8.8.8.8'
+dns_nserver_lines=$'  nserver 9.9.9.9\n  nserver 149.112.112.112'
 tls_clienthello_mode="passthrough"
 bootstrap_only=false
 runtime_only=false
@@ -530,19 +530,23 @@ function detect_country_code_by_ip() {
   return 1
 }
 
-function locate_dns_seed() {
-  # Stdout: absolute path to bundled dns/seed.json, or empty if not found.
-  local script_dir=""
-  script_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" 2>/dev/null && pwd -P 2>/dev/null) || script_dir=""
+function source_dns_selector_or_die() {
+  # Locate dns/select_dns.sh (shared with scripts/migrate_dns_inplace.sh).
+  local gen_dir=""
+  gen_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" 2>/dev/null && pwd -P 2>/dev/null) || gen_dir=""
   local candidates=(
-    "${NETRUN_HOME:-/opt/netrun}/dns/seed.json"
-    "/opt/netrun/dns/seed.json"
-    "${script_dir}/../../dns/seed.json"
-    "${script_dir}/../../../dns/seed.json"
+    "${NETRUN_HOME:-/opt/netrun}/dns/select_dns.sh"
+    "/opt/netrun/dns/select_dns.sh"
+    "${gen_dir}/../../dns/select_dns.sh"
+    "${gen_dir}/../../../dns/select_dns.sh"
   )
   local p=""
   for p in "${candidates[@]}"; do
-    if [ -n "$p" ] && [ -f "$p" ]; then echo "$p"; return 0; fi;
+    if [ -n "$p" ] && [ -f "$p" ]; then
+      # shellcheck disable=SC1090
+      source "$p"
+      return 0
+    fi;
   done
   return 1
 }
@@ -574,76 +578,28 @@ function configure_dns_servers() {
   resolved_country=$(echo "$resolved_country" | tr '[:lower:]' '[:upper:]')
   echo "   Country for DNS selection: ${resolved_country:-unknown}"
 
-  # --- Hardcoded last-resort fallback (Quad9 + Cisco OpenDNS anycast). ---
-  # Used ONLY if seed.json is missing or jq is not installed; otherwise the
-  # `global` tier comes from the seed (same IPs, but data-driven).
-  local -a hardcoded_global_v4=("9.9.9.9" "149.112.112.112" "208.67.222.222" "208.67.220.220")
-
-  # --- Locate bundled seed (built by dns/build_seed.py, Phase 2a) ---
-  local seed_path=""
-  seed_path=$(locate_dns_seed || true)
-
-  local -a country_pool=() continent_pool=() global_pool=()
-  local resolved_continent=""
-
-  if [ -n "$seed_path" ] && command -v jq >/dev/null 2>&1; then
-    if [[ "$resolved_country" =~ ^[A-Z]{2}$ ]]; then
-      mapfile -t country_pool < <(jq -r --arg cc "$resolved_country" \
-        '.countries[$cc].v4 // [] | .[]' "$seed_path" 2>/dev/null)
-      resolved_continent=$(jq -r --arg cc "$resolved_country" \
-        '.country_to_continent[$cc] // ""' "$seed_path" 2>/dev/null \
-        | tr '[:lower:]' '[:upper:]')
-    fi;
-    if [[ "$resolved_continent" =~ ^[A-Z]{2}$ ]]; then
-      mapfile -t continent_pool < <(jq -r --arg kc "$resolved_continent" \
-        '.continents[$kc].v4 // [] | .[]' "$seed_path" 2>/dev/null)
-    fi;
-    mapfile -t global_pool < <(jq -r '.global.v4 // [] | .[]' "$seed_path" 2>/dev/null)
-  else
-    echo "   WARNING: seed.json not found or jq missing (path=${seed_path:-none}) — using hardcoded global fallback"
+  # --- Load shared selector (locate_dns_seed + dns_select_pair) ---
+  if ! source_dns_selector_or_die; then
+    echo "   WARNING: dns/select_dns.sh not found — keeping fallback Quad9 defaults"
+    return
   fi;
 
-  # Backfill global tier from hardcoded list if seed had no global entries.
-  if [ ${#global_pool[@]} -eq 0 ]; then global_pool=("${hardcoded_global_v4[@]}"); fi;
+  # --- Deterministic selection (rotation_key = instance_id == start_port) ---
+  local sel_output=""
+  sel_output=$(dns_select_pair "${resolved_country}" "${instance_id}")
+  local pick1; pick1=$(printf '%s' "$sel_output" | sed -n '1p')
+  local pick2; pick2=$(printf '%s' "$sel_output" | sed -n '2p')
+  local strategy; strategy=$(printf '%s' "$sel_output" | sed -n '3p')
 
-  # Cascade: country (if ≥2) → country+continent (if combined ≥2) → +global.
-  local strategy=""
-  local -a candidates=()
-  if [ ${#country_pool[@]} -ge 2 ]; then
-    candidates=("${country_pool[@]}")
-    strategy="country"
-  elif [ $(( ${#country_pool[@]} + ${#continent_pool[@]} )) -ge 2 ]; then
-    candidates=("${country_pool[@]}" "${continent_pool[@]}")
-    strategy="continent"
-  else
-    candidates=("${country_pool[@]}" "${continent_pool[@]}" "${global_pool[@]}")
-    strategy="global"
+  if [ -z "$pick1" ] || [ -z "$pick2" ]; then
+    echo "   WARNING: dns_select_pair returned empty — keeping fallback Quad9 defaults"
+    return
   fi;
-
-  # Defensive — should never trigger because global_pool always has ≥2.
-  if [ ${#candidates[@]} -lt 2 ]; then
-    candidates=("${hardcoded_global_v4[@]}")
-    strategy="hardcoded_fallback"
-  fi;
-
-  # --- Deterministic rotation by instance_id (== start_port of this batch) ---
-  # Different refill batches on the same node pick different pairs, so the
-  # resolver mix per port-range varies (anti-pool-fingerprint). Country is
-  # mixed into the hash so refills for different geos don't collide.
-  local total=${#candidates[@]}
-  local hash_seed=0
-  hash_seed=$(printf '%s' "rot:${instance_id}:${resolved_country:-XX}" | cksum | awk '{print $1}')
-  local off1=$(( hash_seed % total ))
-  local off2=$(( (hash_seed + 1) % total ))
-  if [ "$off1" = "$off2" ] && [ "$total" -gt 1 ]; then off2=$(( (off1 + 1) % total )); fi;
-
-  local pick1="${candidates[$off1]}"
-  local pick2="${candidates[$off2]}"
 
   dns_nserver_lines="  nserver ${pick1}"$'\n'"  nserver ${pick2}"
   dns_selected_country="${resolved_country:-fallback}"
   dns_selected_servers_csv="${pick1},${pick2}"
-  dns_selection_strategy="seed_${strategy}"
+  dns_selection_strategy="$strategy"
 
   echo "   DNS selected (${dns_selected_country}, ${dns_selection_strategy}, instance_id=${instance_id}): ${dns_selected_servers_csv}"
 }
