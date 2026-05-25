@@ -14,6 +14,7 @@ let _geoCacheAt = 0;
 async function buildDescribe({ healthSnapshot, jobsRoot, proxyRoot } = {}) {
   const ipv6 = healthSnapshot?.ipv6 || null;
   const ipv6Egress = healthSnapshot?.ipv6Egress || null;
+  const dns = healthSnapshot?.dns || null;
 
   return {
     agent_version: AGENT_VERSION,
@@ -25,6 +26,7 @@ async function buildDescribe({ healthSnapshot, jobsRoot, proxyRoot } = {}) {
     geo_code: await detectGeoCode().catch(() => null),
     ipv6: ipv6,
     ipv6_egress: ipv6Egress,
+    dns: dns,
     api_key_required: Boolean(String(process.env.NODE_AGENT_API_KEY || "").trim()),
     jobs_root: jobsRoot || process.env.NODE_AGENT_JOBS_ROOT || "/opt/netrun/jobs",
     proxy_root: proxyRoot || process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver",

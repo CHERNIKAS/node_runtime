@@ -2680,7 +2680,12 @@ async function handleHealth(req, res) {
   const instancesState = await collectRunningInstances();
   const instances = instancesState.instances || [];
   const summary = buildInstanceSummary(instances);
-  const ipv6Check = await checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000);
+  // Fan out ipv6 + dns probes in parallel — each carries its own
+  // ~5s budget, so wall-clock stays bounded by max(probe), not sum.
+  const [ipv6Check, dnsCheck] = await Promise.all([
+    checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
+    checkDns(5000),
+  ]);
   const success = Boolean(instancesState.ok);
   const status = success ? "ready" : "failed";
   const ipv6 = {
@@ -2713,13 +2718,17 @@ async function handleHealth(req, res) {
     instances: instancesPayload,
     ipv6,
     ipv6Egress: ipv6,
+    dns: dnsCheck,
   });
 }
 
 async function handleDescribe(req, res) {
   let healthSnapshot = null;
   try {
-    const ipv6Check = await checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000);
+    const [ipv6Check, dnsCheck] = await Promise.all([
+      checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
+      checkDns(5000),
+    ]);
     const ipv6 = {
       ok: ipv6Check.ok,
       target: ipv6Check.target,
@@ -2727,7 +2736,7 @@ async function handleDescribe(req, res) {
       statusCode: ipv6Check.statusCode,
       body: ipv6Check.body,
     };
-    healthSnapshot = { ipv6, ipv6Egress: ipv6 };
+    healthSnapshot = { ipv6, ipv6Egress: ipv6, dns: dnsCheck };
   } catch (_err) {
     healthSnapshot = null;
   }
