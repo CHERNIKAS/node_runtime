@@ -10,6 +10,11 @@ Environment=NODE_AGENT_HOST=0.0.0.0
 Environment=NODE_AGENT_PORT=8085
 Environment=NODE_AGENT_PROXY_ROOT=/opt/netrun/proxyserver
 Environment=NODE_AGENT_JOBS_ROOT=/opt/netrun/jobs
+# Whole catalog is dualstack (IPv6-preferred + IPv4 fallback) since the 2026-05
+# fleet migration. The node-agent guard rejects generation whose ipv6_policy
+# != this value; default is "ipv6_only" which would reject the orchestrator's
+# strict_dual_stack jobs → empty refill. Set it so new nodes serve dualstack OOTB.
+Environment=NODE_AGENT_REQUIRED_IPV6_POLICY=strict_dual_stack
 ExecStart=/usr/bin/node /opt/netrun/node_runtime/node_agent/server.js
 Restart=always
 RestartSec=3
