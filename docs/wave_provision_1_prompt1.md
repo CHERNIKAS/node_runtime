@@ -160,4 +160,14 @@ Partial-failure пример (installer упал на health-check):
 ---
 
 ## Журнал прогресса
-- (заполняется по этапам)
+- **A** (commit `05deb75`) — `deploy/node/cloud-init.sh` + journal scaffold (ПОДГОТОВКА +
+  ЭТАП A/B/C). shellcheck 0.10.0 чисто. Blob = pure LF (0 CR, `file` → shell script).
+  jq-payload провалидирован (ok→bool, exit_code→int, log_tail escape).
+- **B** — контракт `/v1/nodes/register` зафиксирован выше (документ-only, влит в commit A).
+  Промпт ② реализует ТОЧНО так.
+- **C** (commit pending) — `deploy/node/cloud-init.yaml` (опц. #cloud-config обёртка,
+  base64-embed без дублирования), `docs/cloud_init_provisioning.md` (README: генерация
+  user_data / контракт / security-модель секрета / каветы), `.gitattributes` (`*.sh eol=lf`
+  — защита от CRLF на будущих правках). Устойчивость (callback на failure, set +x вокруг
+  секрета) реализована в .sh ещё в commit A.
+- **НЕ запушено** (жду «ок пуш»). Backup: `backup/provision-1-prompt1-pre` @ `55bd5e1`.
