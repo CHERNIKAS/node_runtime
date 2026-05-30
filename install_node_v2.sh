@@ -533,6 +533,39 @@ DOCTOR
   chmod +x "$DOCTOR_SCRIPT"
 }
 
+# Trend monitor — logs node metrics every 5 min to /var/log/netrun-trend.log.
+# Canary for the IPv6/MLD leak the 98-netrun-ipv6.conf sysctl guards against.
+# Was a manual step (NODE_SETUP_RUNBOOK.md §5); now auto-installed by v2.
+install_trend_monitor() {
+  log "Installing trend_monitor.sh + cron (*/5)"
+  mkdir -p /opt/netrun/scripts
+  cat > /opt/netrun/scripts/trend_monitor.sh <<'TREND'
+#!/usr/bin/env bash
+LOG=/var/log/netrun-trend.log
+ts=$(date '+%Y-%m-%d %H:%M:%S')
+threads=$(ls -d /proc/*/task/* 2>/dev/null | wc -l)
+proc3=$(pgrep -c 3proxy)
+listening=$(ss -tln 2>/dev/null | grep -cE ':(2|3|4|5|6)[0-9]{4} ')
+estab=$(ss -tn state established 2>/dev/null | wc -l)
+ipv6cnt=$(ip -6 addr show scope global 2>/dev/null | grep -c 'inet6')
+mem=$(free -m | awk '/^Mem:/ {print $3"/"$2}')
+conntrack=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
+cronpids=$(cat /sys/fs/cgroup/system.slice/cron.service/pids.current 2>/dev/null || echo 0)
+fd=$(awk '{print $1}' /proc/sys/fs/file-nr)
+load=$(cut -d' ' -f1 /proc/loadavg)
+echo "$ts threads=$threads 3proxy=$proc3 listen=$listening estab=$estab ipv6=$ipv6cnt mem=${mem}MB conntrack=$conntrack cronpids=$cronpids fd=$fd load=$load" >> $LOG
+TREND
+  chmod +x /opt/netrun/scripts/trend_monitor.sh
+
+  # cron.d (NOT root crontab — the generator owns its @reboot proxy-startup
+  # entries there; we must not touch them). cron.d format has a user field.
+  cat > /etc/cron.d/netrun-trend-monitor <<'EOF'
+# NETRUN trend monitor — метрики ноды каждые 5 мин в /var/log/netrun-trend.log
+*/5 * * * * root /opt/netrun/scripts/trend_monitor.sh
+EOF
+  chmod 0644 /etc/cron.d/netrun-trend-monitor
+}
+
 verify_health() {
   log "Waiting for /health"
   local health=""
@@ -572,6 +605,7 @@ main() {
 
   install_3proxy_restore_unit
   install_doctor_script
+  install_trend_monitor
 
   verify_health
 
