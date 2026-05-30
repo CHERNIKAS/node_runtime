@@ -20,6 +20,7 @@ JOBS_ROOT="/opt/netrun/jobs"
 SERVICE_NAME="netrun-node-agent"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-netrun.conf"
+SYSCTL_IPV6_FILE="/etc/sysctl.d/98-netrun-ipv6.conf"
 LIMITS_FILE="/etc/security/limits.d/99-netrun.conf"
 RESOLV_CONF="/etc/resolv.conf"
 RESTORE_SERVICE_NAME="netrun-3proxy-restore"
@@ -191,6 +192,20 @@ net.ipv4.tcp_mtu_probing = 1
 net.ipv6.conf.all.accept_ra = 2
 net.ipv6.conf.default.accept_ra = 2
 EOF
+  # === DAD/MLD off (second file, name 98- so node_followup_v2.sh — which
+  # overwrites ONLY 99-netrun.conf — leaves it intact) ===
+  cat > "$SYSCTL_IPV6_FILE" <<'EOF'
+# NETRUN — DAD/MLD off. Тысячи IPv6 на интерфейсе → DAD/MLD overload
+# (mld_ifc_work грузит CPU). DAD не нужен для наших управляемых unicast-адресов
+# (контролируем /64 сами, коллизий нет). Без этого файла нода деградирует
+# при раздувании пула до тысяч портов. Имя 98- (раньше 99-netrun.conf), чтобы
+# node_followup_v2.sh (перезаписывает только 99-) его не затирал.
+net.ipv6.conf.all.dad_transmits = 0
+net.ipv6.conf.default.dad_transmits = 0
+net.ipv6.conf.all.accept_dad = 0
+net.ipv6.conf.default.accept_dad = 0
+net.ipv6.mld_max_msf = 1
+EOF
   # Strip any legacy tcp_timestamps line from /etc/sysctl.conf — old generator
   # wrote =0 there, which is processed AFTER sysctl.d and would override our =1.
   if [ -f /etc/sysctl.conf ]; then
@@ -199,6 +214,7 @@ EOF
   # Tolerate "cannot stat" warnings (e.g. if a netfilter key still not exposed)
   sysctl --system >/dev/null 2>&1 || true
   sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" || true
+  sysctl -p "$SYSCTL_IPV6_FILE" >/dev/null 2>&1 || true
 }
 
 configure_file_limits() {
