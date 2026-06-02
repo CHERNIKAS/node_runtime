@@ -137,7 +137,7 @@ logger -t "\$LOG_TAG" "starting: \$total cfgs need 3proxy spawn, parallel=\$PARA
 started=0
 < "\$worklist" xargs -n 1 -P "\$PARALLEL" -I {} bash -c '
   "'"\$PROXY_BIN"'" "{}" </dev/null >/dev/null 2>&1 & disown 2>/dev/null || true
-  sleep 0.'\$SLEEP_MS''  # micro-pause between spawns within a stream
+  sleep 0.'"\$SLEEP_MS"'
 ' 2>/dev/null || true
 
 sleep 3
