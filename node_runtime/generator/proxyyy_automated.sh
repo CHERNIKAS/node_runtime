@@ -15,7 +15,7 @@ function usage() { echo "Usage: $0 [-s | --subnet <16|32|48|64|80|96|112> proxy 
                           [-u | --username <string> proxy auth username] 
                           [-p | --password <string> proxy password]
                           [--random <bool> generate random username/password for each IPv4 backconnect proxy instead of predefined (default false)] 
-                          [-t | --proxies-type <http|socks5> result proxies type (default socks5)]
+                          [-t | --proxies-type <http|socks5|dual> result proxies type (default socks5; 'dual' = socks5 + paired http on port-10000)]
                           [-r | --rotating-interval <0-59> proxies external address rotating time in minutes (default 0, disabled)]
                           [--start-port <5000-65536> start port for backconnect ipv4 (default 30000)]
                           [-l | --localhost <bool> allow connections only for localhost (backconnect on 127.0.0.1)]
@@ -193,8 +193,17 @@ function check_startup_parameters() {
     log_err_print_usage_and_exit "Error: don't provide user or password as arguments, if '--random' flag is set.";
   fi;
 
-  if [ $proxies_type != "http" ] && [ $proxies_type != "socks5" ]; then
-    log_err_print_usage_and_exit "Error: invalid value of '-t' (proxy type) parameter";
+  # Wave HTTP.A — 'dual' adds an http listener alongside socks5 on a
+  # paired port (http = socks - 10000) for every IP. 'http'/'socks5'
+  # single modes are unchanged (default socks5).
+  if [ $proxies_type != "http" ] && [ $proxies_type != "socks5" ] && [ $proxies_type != "dual" ]; then
+    log_err_print_usage_and_exit "Error: invalid value of '-t' (proxy type) parameter (http|socks5|dual)";
+  fi;
+
+  # Wave HTTP.A — for dual the http port = socks port - 10000, so the
+  # socks start_port must leave room above 5000 for the http range.
+  if [ $proxies_type = "dual" ] && [ $start_port -lt 15000 ]; then
+    log_err_print_usage_and_exit "Error: for '--proxies-type dual' '--start-port' must be >= 15000 (http port = socks port - 10000, must stay >= 5000)";
   fi;
 
   if [ "$ipv6_policy" != "strict_dual_stack" ] && [ "$ipv6_policy" != "ipv6_required" ] && [ "$ipv6_policy" != "ipv6_only" ]; then
@@ -870,6 +879,13 @@ $dns_nserver_lines
 	      IFS=\$' \t\n';
 	    fi;
 	    echo "\$proxy_startup_depending_on_type -p\$port -i$backconnect_ipv4 -e\$random_ipv6_address" >> $proxyserver_config_path;
+	    # Wave HTTP.A — dual mode: also emit a paired http listener on
+	    # port-10000 for the SAME IPv6. The "$proxies_type" literal is
+	    # baked at generation time, so for socks5/http this branch is a
+	    # dead no-op (backward-compatible).
+	    if [ "$proxies_type" = "dual" ]; then
+	      echo "proxy $mode_flag -n -a -p\$((port - 10000)) -i$backconnect_ipv4 -e\$random_ipv6_address" >> $proxyserver_config_path;
+	    fi;
 	    ((port+=1))
 	    ((count+=1))
 	done
@@ -898,8 +914,12 @@ EOF
 function close_ufw_backconnect_ports() {
   if ! is_package_installed "ufw" || [ $use_localhost = true ] || ! test -f $backconnect_proxies_file; then return; fi;
 
-  local first_opened_port=$(head -n 1 $backconnect_proxies_file | awk -F ':' '{print $2}');
-  local last_opened_port=$(tail -n 1 $backconnect_proxies_file | awk -F ':' '{print $2}');
+  # Wave HTTP.A — strip an optional "scheme://login:pass@" prefix first so
+  # this works for BOTH the legacy "ipv4:port:login:pass" lines and the
+  # dual "scheme://login:pass@ipv4:port" URI lines; then field 2 (by ':')
+  # is the port in either case.
+  local first_opened_port=$(head -n 1 $backconnect_proxies_file | sed -E 's#^[a-zA-Z0-9]+://[^@]*@##' | awk -F ':' '{print $2}');
+  local last_opened_port=$(tail -n 1 $backconnect_proxies_file | sed -E 's#^[a-zA-Z0-9]+://[^@]*@##' | awk -F ':' '{print $2}');
 
   ufw delete allow $first_opened_port:$last_opened_port/tcp >> $script_log_file 2>&1 || true;
   ufw delete allow $first_opened_port:$last_opened_port/udp >> $script_log_file 2>&1 || true;
@@ -931,6 +951,16 @@ function open_ufw_backconnect_ports() {
       ufw allow $start_port:$last_port/tcp >> $script_log_file 2>&1 || true;
       ufw allow $start_port:$last_port/udp >> $script_log_file 2>&1 || true;
       port_range="$start_port:$last_port"
+    fi;
+
+    # Wave HTTP.A — dual mode also listens on the paired http range
+    # (socks range shifted down by 10000); open it too.
+    if [ "$proxies_type" = "dual" ]; then
+      local http_start=$((start_port - 10000));
+      local http_last=$((last_port - 10000));
+      ufw allow $http_start:$http_last/tcp >> $script_log_file 2>&1 || true;
+      ufw allow $http_start:$http_last/udp >> $script_log_file 2>&1 || true;
+      echo "UFW http ports $http_start:$http_last (dual) opened";
     fi;
 
     # Р СџРЎР‚Р С•Р Р†Р ВµРЎР‚РЎРЏР ВµР С Р Р…Р В°Р В»Р С‘РЎвЂЎР С‘Р Вµ Р С—РЎР‚Р В°Р Р†Р С‘Р В»Р В° (РЎС“Р В»РЎС“РЎвЂЎРЎв‚¬Р ВµР Р…Р Р…Р В°РЎРЏ Р С—РЎР‚Р С•Р Р†Р ВµРЎР‚Р С”Р В°)
@@ -1297,7 +1327,22 @@ function write_backconnect_proxies_to_file() {
       ((count+=1))
     fi;
     # Р СџР ВµРЎР‚Р Р†Р В°РЎРЏ Р В·Р В°Р С—Р С‘РЎРѓРЎРЉ Р С—Р ВµРЎР‚Р ВµР В·Р В°Р С—Р С‘РЎРѓРЎвЂ№Р Р†Р В°Р ВµРЎвЂљ РЎвЂћР В°Р в„–Р В» (>), Р С•РЎРѓРЎвЂљР В°Р В»РЎРЉР Р…РЎвЂ№Р Вµ Р Т‘Р С•Р В±Р В°Р Р†Р В»РЎРЏРЎР‹РЎвЂљ (>>)
-    if [ "$first_line" = true ]; then
+    if [ "$proxies_type" = "dual" ]; then
+      # Wave HTTP.A — dual emits TWO self-describing URI lines per IP so
+      # the node-agent reports both with an explicit protocol tag:
+      #   socks5://login:pass@ipv4:<socks_port>
+      #   http://login:pass@ipv4:<http_port>   (http_port = socks_port - 10000)
+      # proxy_credentials is ":login:pass" → strip the leading ':'.
+      local creds="${proxy_credentials#:}";
+      local http_port=$((port - 10000));
+      if [ "$first_line" = true ]; then
+        echo "socks5://${creds}@$backconnect_ipv4:$port" > $backconnect_proxies_file;
+        first_line=false;
+      else
+        echo "socks5://${creds}@$backconnect_ipv4:$port" >> $backconnect_proxies_file;
+      fi;
+      echo "http://${creds}@$backconnect_ipv4:$http_port" >> $backconnect_proxies_file;
+    elif [ "$first_line" = true ]; then
       echo "$backconnect_ipv4:$port$proxy_credentials" > $backconnect_proxies_file;
       first_line=false;
     else
@@ -1325,6 +1370,11 @@ function write_port_ipv6_map_file() {
   while IFS= read -r ipv6_address; do
     if [ -z "$ipv6_address" ]; then continue; fi;
     echo "$port,$ipv6_address,$backconnect_ipv4,$instance_id" >> $port_ipv6_map_file;
+    # Wave HTTP.A — dual: persist the paired http port (socks - 10000) for
+    # the SAME IPv6 so a reboot/restore rebuilds BOTH listeners.
+    if [ "$proxies_type" = "dual" ]; then
+      echo "$((port - 10000)),$ipv6_address,$backconnect_ipv4,$instance_id" >> $port_ipv6_map_file;
+    fi;
     ((port+=1))
     if [ $port -gt $last_port ]; then break; fi;
   done < $random_ipv6_list_file

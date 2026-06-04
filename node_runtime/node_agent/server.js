@@ -36,8 +36,11 @@ const PRODUCTION_FINGERPRINT_PROFILE_VERSION = (
 const PRODUCTION_INTENDED_CLIENT_OS_PROFILE = "android_mobile";
 const PRODUCTION_REQUIRED_NETWORK_PROFILE = "high_compatibility";
 const ALLOWED_IPV6_POLICIES = new Set(["ipv6_only", "strict_dual_stack", "ipv6_required"]);
-const _envIpv6Policy = String(process.env.NODE_AGENT_REQUIRED_IPV6_POLICY || "ipv6_only").trim().toLowerCase();
-const PRODUCTION_REQUIRED_IPV6_POLICY = ALLOWED_IPV6_POLICIES.has(_envIpv6Policy) ? _envIpv6Policy : "ipv6_only";
+// Wave NODE-NEW-MODERNIZE — default egress policy is strict_dual_stack
+// (ipv6_only is deprecated/dead). New nodes pick this up with NO env
+// dependency; NODE_AGENT_REQUIRED_IPV6_POLICY still overrides if set.
+const _envIpv6Policy = String(process.env.NODE_AGENT_REQUIRED_IPV6_POLICY || "strict_dual_stack").trim().toLowerCase();
+const PRODUCTION_REQUIRED_IPV6_POLICY = ALLOWED_IPV6_POLICIES.has(_envIpv6Policy) ? _envIpv6Policy : "strict_dual_stack";
 const PRODUCTION_IPV6_ROLLOUT_STAGE = "enforced";
 const PRODUCTION_CLIENT_OS_PROFILE_ENFORCEMENT = "not_controlled_by_proxy";
 const PRODUCTION_EFFECTIVE_CLIENT_PROFILE = "not_controlled_by_proxy";
@@ -250,7 +253,17 @@ function parseProxyLine(rawLine) {
   }
   if (/^socks5:\/\//i.test(original)) {
     const line = original.slice(original.indexOf("//") + 2);
-    const parsed = parseUserPassHostPort(line, original);
+    const parsed = parseUserPassHostPort(line, original, "socks5");
+    if (parsed) {
+      return parsed;
+    }
+  }
+  // Wave HTTP.A — dual mode writes explicit http:// lines alongside
+  // socks5:// ones; parse them and tag protocol so the report (and the
+  // orchestrator downstream) can tell the two listeners apart.
+  if (/^http:\/\//i.test(original)) {
+    const line = original.slice(original.indexOf("//") + 2);
+    const parsed = parseUserPassHostPort(line, original, "http");
     if (parsed) {
       return parsed;
     }
@@ -258,7 +271,7 @@ function parseProxyLine(rawLine) {
   return parseLegacyColonProxyLine(original);
 }
 
-function parseUserPassHostPort(line, rawLine) {
+function parseUserPassHostPort(line, rawLine, protocol = "socks5") {
   if (!line.includes("@")) {
     return null;
   }
@@ -277,7 +290,9 @@ function parseUserPassHostPort(line, rawLine) {
   if (!login || !password || !host || !Number.isInteger(port) || port <= 0 || port > 65535) {
     return null;
   }
-  return { login, password, host, port, raw_line: rawLine };
+  // Wave HTTP.A — ``protocol`` tags the listener kind (socks5|http) so a
+  // dual job can report both URIs per IP distinctly.
+  return { login, password, host, port, protocol, raw_line: rawLine };
 }
 
 function parseLegacyColonProxyLine(line) {
@@ -297,6 +312,7 @@ function parseLegacyColonProxyLine(line) {
     password,
     host,
     port,
+    protocol: "socks5",
     raw_line: `Socks5://${login}:${password}@${host}:${port}`,
   };
 }
@@ -581,6 +597,16 @@ function collectJobParams(body, rawArgs) {
   const networkProfile = String(
     body.network_profile ?? body.networkProfile ?? getFlagValue(rawArgs, ["--network-profile"]) ?? ""
   ).trim();
+  // Wave HTTP.A — proxies type: socks5 (default, backward-compat) | http |
+  // dual (socks5 + paired http). A job without protocol/proxies_type stays
+  // socks5-only exactly as before.
+  const rawProxiesType = String(
+    body.proxies_type ?? body.proxiesType ?? body.protocol
+      ?? getFlagValue(rawArgs, ["--proxies-type", "-t"]) ?? ""
+  ).trim().toLowerCase();
+  const proxiesType = ["http", "socks5", "dual"].includes(rawProxiesType)
+    ? rawProxiesType
+    : "socks5";
   const requestedFingerprintProfileVersion = String(
     getBodyValue(body, "fingerprint_profile_version", "fingerprintProfileVersion") || ""
   ).trim();
@@ -614,7 +640,7 @@ function collectJobParams(body, rawArgs) {
     false
   );
   const intendedIpv6Policy = String(
-    getBodyValue(body, "intended_ipv6_policy", "intendedIpv6Policy") || ipv6Policy || "ipv6_only"
+    getBodyValue(body, "intended_ipv6_policy", "intendedIpv6Policy") || ipv6Policy || "strict_dual_stack"
   ).trim();
   const effectiveIpv6Policy = String(
     getBodyValue(body, "effective_ipv6_policy", "effectiveIpv6Policy") || ipv6Policy || intendedIpv6Policy
@@ -649,6 +675,7 @@ function collectJobParams(body, rawArgs) {
     proxyCount,
     ipv6Policy: profile.effective_ipv6_policy || ipv6Policy,
     networkProfile: profile.effective_network_profile || networkProfile,
+    proxiesType,
     profile,
   };
 }
@@ -1010,6 +1037,37 @@ function socks5AuthCheck(item, timeoutMs = DEFAULT_AUTH_CHECK_TIMEOUT_MS) {
   });
 }
 
+function httpListenerCheck(item, timeoutMs = DEFAULT_AUTH_CHECK_TIMEOUT_MS) {
+  // Wave HTTP.A — for http listeners we can't run the SOCKS5 handshake;
+  // do a lightweight TCP-connect liveness check (the listener accepting a
+  // connection proves the 3proxy http instance is up on that port).
+  return new Promise((resolve) => {
+    const host = String(item.host || "").trim();
+    const port = toPositiveInt(item.port, 0);
+    if (!host || !port) {
+      resolve({ ok: false, error: "invalid_proxy_item" });
+      return;
+    }
+    const socket = new net.Socket();
+    let done = false;
+    const finish = (payload) => {
+      if (done) return;
+      done = true;
+      try { socket.destroy(); } catch (_e) { /* noop */ }
+      resolve(payload);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish({ ok: true, error: null }));
+    socket.once("timeout", () => finish({ ok: false, error: "timeout" }));
+    socket.once("error", (err) => finish({ ok: false, error: String(err && err.code || "connect_error") }));
+    try {
+      socket.connect(port, host);
+    } catch (err) {
+      finish({ ok: false, error: String(err && err.message || "connect_throw") });
+    }
+  });
+}
+
 async function runLocalAuthChecks(items, sampleCount) {
   const samples = (items || []).slice(0, Math.max(1, sampleCount));
   if (!samples.length) {
@@ -1028,7 +1086,11 @@ async function runLocalAuthChecks(items, sampleCount) {
   let failed = 0;
 
   for (const item of samples) {
-    const result = await socks5AuthCheck(item, DEFAULT_AUTH_CHECK_TIMEOUT_MS);
+    // Wave HTTP.A — http listeners get a TCP-liveness check; socks5 (and
+    // untagged legacy items) keep the full SOCKS5 auth handshake.
+    const result = item && item.protocol === "http"
+      ? await httpListenerCheck(item, DEFAULT_AUTH_CHECK_TIMEOUT_MS)
+      : await socks5AuthCheck(item, DEFAULT_AUTH_CHECK_TIMEOUT_MS);
     if (result.ok) {
       passed += 1;
     } else {
@@ -1038,6 +1100,7 @@ async function runLocalAuthChecks(items, sampleCount) {
       host: item.host,
       port: item.port,
       login: item.login,
+      protocol: item.protocol || "socks5",
       ok: result.ok,
       error: result.error || null,
     });
@@ -1227,7 +1290,7 @@ async function cleanupCronStartup(startupScriptPath) {
   };
 }
 
-async function buildGeneratorArgs({ rawArgs, scriptPath, startPort, proxyCount, ipv6Policy, networkProfile, proxiesListPath, mapCsvPath }) {
+async function buildGeneratorArgs({ rawArgs, scriptPath, startPort, proxyCount, ipv6Policy, networkProfile, proxiesType, proxiesListPath, mapCsvPath }) {
   let args = Array.isArray(rawArgs) ? rawArgs.map((v) => String(v)) : [];
 
   args = upsertFlag(args, "--start-port", String(startPort));
@@ -1252,7 +1315,9 @@ async function buildGeneratorArgs({ rawArgs, scriptPath, startPort, proxyCount, 
     }
   }
   if (await scriptSupportsFlag(scriptPath, "--proxies-type")) {
-    args = upsertFlag(args, "--proxies-type", "socks5", ["-t"]);
+    // Wave HTTP.A — honour the job's proxies type (default socks5 keeps
+    // the legacy single-socks flow byte-for-byte identical).
+    args = upsertFlag(args, "--proxies-type", proxiesType || "socks5", ["-t"]);
   }
   if (await scriptSupportsFlag(scriptPath, "--random")) {
     args = upsertFlag(args, "--random", "true");
@@ -2213,6 +2278,7 @@ async function handleGenerate(req, res) {
       proxyCount: params.proxyCount,
       ipv6Policy: params.ipv6Policy,
       networkProfile: params.networkProfile,
+      proxiesType: params.proxiesType,
       proxiesListPath,
       mapCsvPath,
     });
@@ -2844,8 +2910,26 @@ const server = http.createServer(async (req, res) => {
   sendJson(res, 404, { success: false, status: "failed", error: "not_found" });
 });
 
-server.listen(PORT, () => {
-  console.log(
-    `[node-agent] listening on :${PORT}, jobs_root=${JOBS_ROOT}, proxy_root=${PROXY_ROOT}, cron_cleanup=${CLEANUP_CRON_AFTER_RUN}`
-  );
-});
+// Wave HTTP.A — only bind the port when run as the entrypoint, so unit
+// tests can ``require`` this module and exercise the pure helpers below
+// without starting a listener. Behaviour when launched directly (the
+// node-agent process) is unchanged.
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log(
+      `[node-agent] listening on :${PORT}, jobs_root=${JOBS_ROOT}, proxy_root=${PROXY_ROOT}, cron_cleanup=${CLEANUP_CRON_AFTER_RUN}`
+    );
+  });
+}
+
+// Wave HTTP.A — exported for unit tests (dual-proxy parse/report + arg
+// building). No effect on the running agent.
+module.exports = {
+  parseProxyLine,
+  parseProxiesList,
+  buildGeneratorArgs,
+  collectJobParams,
+  // Wave NODE-NEW-MODERNIZE — exported so tests can assert the egress
+  // policy default (strict_dual_stack) + env override.
+  PRODUCTION_REQUIRED_IPV6_POLICY,
+};

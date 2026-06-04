@@ -392,7 +392,7 @@ RESTORESH
   cat > "$RESTORE_SERVICE_FILE" <<EOF
 [Unit]
 Description=NETRUN — restore all 3proxy instances from saved cfg files
-Documentation=https://github.com/Tmwyw/node_runtime
+Documentation=https://github.com/Tmwyw/node_runtime_new
 After=network-online.target ${SERVICE_NAME}.service
 Wants=network-online.target
 
