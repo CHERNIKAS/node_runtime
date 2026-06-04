@@ -5,7 +5,7 @@ Self-contained NETRUN proxy node runtime. This repo is only for the node-agent a
 ## Fresh Node Install
 
 ```bash
-git clone https://github.com/Tmwyw/node_runtime.git /opt/netrun
+git clone https://github.com/Tmwyw/node_runtime_new.git /opt/netrun
 cd /opt/netrun
 bash install_node.sh
 ```

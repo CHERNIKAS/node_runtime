@@ -3,7 +3,7 @@
 #
 # Run on a fresh Ubuntu 22.04+ node as root:
 #
-#   curl -fsSL https://raw.githubusercontent.com/Tmwyw/node_runtime/main/scripts/quick-install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/Tmwyw/node_runtime_new/main/scripts/quick-install.sh \
 #     | bash -s -- \
 #         --orch-url http://51.38.205.194:8090 \
 #         --orch-api-key YOUR_API_KEY_HERE \
@@ -12,7 +12,7 @@
 #
 # What it does (in order):
 #   1. Updates apt, installs git/curl/jq
-#   2. Clones https://github.com/Tmwyw/node_runtime → /tmp/netrun-source
+#   2. Clones https://github.com/Tmwyw/node_runtime_new → /tmp/netrun-source
 #   3. Runs install_node.sh (UFW purge + DNS pin + sysctl tune + node-agent + 3proxy-restore + doctor)
 #   4. Verifies node-agent /health returns 200
 #   5. Registers the node with orchestrator via POST /v1/nodes/enroll
@@ -27,7 +27,7 @@ ORCH_URL=""
 ORCH_API_KEY=""
 NODE_NAME=""
 GEO=""
-REPO_URL="https://github.com/Tmwyw/node_runtime.git"
+REPO_URL="https://github.com/Tmwyw/node_runtime_new.git"
 REPO_BRANCH="main"
 CAPACITY=4000
 WEIGHT=100
@@ -50,7 +50,7 @@ Optional:
   --max-parallel-jobs N   Concurrent /generate jobs (default 1)
   --max-batch-size N      Max ports per job (default 1500)
   --branch NAME           Repo branch to clone (default main)
-  --repo URL              Override repo URL (default Tmwyw/node_runtime)
+  --repo URL              Override repo URL (default Tmwyw/node_runtime_new)
 
 Example:
   bash quick-install.sh \
