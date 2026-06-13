@@ -153,8 +153,13 @@ async function getCountersForPorts(ports) {
   const out = {};
   for (const [port, b] of buckets) {
     if (!b.present) continue;
+    // Wave PERGB-METER-FIX — _in = client->proxy upload, _out = proxy->client
+    // download (BILLABLE), both family-agnostic (client-port rules). The legacy
+    // v6-egress `in6` counter is retired (it captured ~0 under dual-stack); on a
+    // not-yet-reaccounted node it's still parsed into b.in6 but no longer summed
+    // (it was egress-IPv6 garbage), so we read b.in alone.
     out[String(port)] = {
-      bytes_in: b.in + b.in6,
+      bytes_in: b.in,
       bytes_out: b.out,
     };
   }
