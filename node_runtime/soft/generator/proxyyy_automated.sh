@@ -1103,44 +1103,59 @@ function setup_nftables_counters() {
       continue
     fi
     
-    # Delete existing rules for this proxy (cleanup)
-    nft delete rule inet proxy_accounting input tcp dport "$port" 2>/dev/null || true
+    # Wave PERGB-METER-FIX (2026-06-13): meter on the CLIENT-FACING port, NOT the
+    # egress IPv6. The old _out/_in6 rules matched a single fixed egress IPv6
+    # (-e<ipv6>), but strict_dual_stack egresses over IPv4 / a rotated IPv6 -> the
+    # download matched no rule -> ~0% captured. The listening port is fixed and, in
+    # an `inet` table, a bare `tcp dport/sport` rule counts BOTH v4 and v6 clients.
+    #   proxy_<port>_in  = client -> proxy  (upload, both families)
+    #   proxy_<port>_out = proxy  -> client (DOWNLOAD delivered to client = BILLABLE)
+    # DUAL: the paired http listener (socks port - 10000) folds into the SAME
+    # counters so http traffic bills the same pool (http port is not its own polled
+    # proxy_inventory row). This whole block is idempotent => also the live-reaccount path.
+    local http_port=$((port - 10000))
+
+    # Cleanup: legacy egress-IPv6 rules + retired _in6 counter, and any prior
+    # client-port rules (so re-running on a live port is a clean swap).
     nft delete rule inet proxy_accounting output ip6 saddr "$ipv6" 2>/dev/null || true
-    nft delete rule inet proxy_accounting input ip6 daddr "$ipv6" 2>/dev/null || true
-    
-    # Delete existing named counters if they exist
-    nft delete counter inet proxy_accounting "proxy_${port}_in" 2>/dev/null || true
-    nft delete counter inet proxy_accounting "proxy_${port}_out" 2>/dev/null || true
+    nft delete rule inet proxy_accounting input  ip6 daddr "$ipv6" 2>/dev/null || true
     nft delete counter inet proxy_accounting "proxy_${port}_in6" 2>/dev/null || true
-    
-    # Create named counters first
-    nft add counter inet proxy_accounting "proxy_${port}_in" 2>/dev/null || true
+    while nft delete rule inet proxy_accounting input  tcp dport "$port" 2>/dev/null; do :; done
+    while nft delete rule inet proxy_accounting output tcp sport "$port" 2>/dev/null; do :; done
+    if [ "$proxies_type" = "dual" ]; then
+      while nft delete rule inet proxy_accounting input  tcp dport "$http_port" 2>/dev/null; do :; done
+      while nft delete rule inet proxy_accounting output tcp sport "$http_port" 2>/dev/null; do :; done
+    fi
+    nft delete counter inet proxy_accounting "proxy_${port}_in"  2>/dev/null || true
+    nft delete counter inet proxy_accounting "proxy_${port}_out" 2>/dev/null || true
+
+    # Two named counters per port.
+    nft add counter inet proxy_accounting "proxy_${port}_in"  2>/dev/null || true
     nft add counter inet proxy_accounting "proxy_${port}_out" 2>/dev/null || true
-    nft add counter inet proxy_accounting "proxy_${port}_in6" 2>/dev/null || true
     
-    # РІСљвЂ¦ IPv4 INPUT counter: client -> proxy (bytesIn)
-    # Counts incoming connections to proxy port
+    # Client upload: client -> proxy (input tcp dport <port>). In an inet table this
+    # bare tcp-dport rule counts BOTH IPv4 and IPv6 clients.
     local err_msg=$(nft add rule inet proxy_accounting input tcp dport "$port" counter name "proxy_${port}_in" comment "proxy_${port}_in" 2>&1)
     if [ $? -eq 0 ]; then
       added_count=$((added_count + 1))
     else
-      echo "   РІСњРЉ Failed INPUT rule for port $port: $err_msg"
+      echo "   [ERR] Failed IN rule for port $port: $err_msg"
       failed_count=$((failed_count + 1))
     fi
-    
-    # РІСљвЂ¦ IPv6 OUTPUT counter: proxy -> internet (bytesOut)
-    # Counts by IPv6 SOURCE address (not port!) because outgoing connections use random ports
-    err_msg=$(nft add rule inet proxy_accounting output ip6 saddr "$ipv6" counter name "proxy_${port}_out" comment "proxy_${port}_out" 2>&1)
+
+    # Download = BILLABLE: proxy -> client (output tcp sport <port>), both families.
+    # This is the byte volume the customer paid GBs for, independent of egress family/address.
+    err_msg=$(nft add rule inet proxy_accounting output tcp sport "$port" counter name "proxy_${port}_out" comment "proxy_${port}_out" 2>&1)
     if [ $? -ne 0 ]; then
-      echo "   РІСњРЉ Failed OUTPUT rule for IPv6 $ipv6 (port $port): $err_msg"
+      echo "   [ERR] Failed OUT rule for port $port: $err_msg"
       failed_count=$((failed_count + 1))
     fi
-    
-    # РІСљвЂ¦ IPv6 INPUT counter: internet -> proxy (responses, optional but useful)
-    # Counts responses coming back to proxy IPv6
-    err_msg=$(nft add rule inet proxy_accounting input ip6 daddr "$ipv6" counter name "proxy_${port}_in6" comment "proxy_${port}_in6" 2>&1)
-    if [ $? -ne 0 ]; then
-      echo "   РІСњРЉ Failed INPUT6 rule for IPv6 $ipv6 (port $port): $err_msg"
+
+    # DUAL: fold the paired http listener (socks port - 10000) into the SAME counters,
+    # so http-proxy traffic bills the same pool (http port is not its own polled row).
+    if [ "$proxies_type" = "dual" ]; then
+      nft add rule inet proxy_accounting input  tcp dport "$http_port" counter name "proxy_${port}_in"  comment "proxy_${port}_in_http"  2>/dev/null || true
+      nft add rule inet proxy_accounting output tcp sport "$http_port" counter name "proxy_${port}_out" comment "proxy_${port}_out_http" 2>/dev/null || true
     fi
     
     # Show progress every 100
@@ -1150,14 +1165,10 @@ function setup_nftables_counters() {
   done
   
   if [ $failed_count -gt 0 ]; then
-    echo "РІС™В РїС‘РЏ  Setup $added_count nftables counters (IPv6-address based) with $failed_count failures"
+    echo "РІС™В РїС‘РЏ  Setup $added_count nftables counters (client-port based) with $failed_count failures"
   else
-    echo "РІСљвЂ¦ Setup $added_count nftables counters (IPv6-address based)"
+    echo "РІСљвЂ¦ Setup $added_count nftables counters (client-port based)"
   fi
-  echo "   СЂСџвЂњР‰ Counter strategy:"
-  echo "      РІР‚Сћ IPv4 INPUT: tcp dport (client РІвЂ вЂ™ proxy bytesIn)"
-  echo "      РІР‚Сћ IPv6 OUTPUT: ip6 saddr (proxy РІвЂ вЂ™ internet bytesOut)"
-  echo "      РІР‚Сћ IPv6 INPUT: ip6 daddr (internet РІвЂ вЂ™ proxy responses)"
   
   # Save nftables rules for persistence
   echo "СЂСџвЂ™С• Saving nftables rules for persistence..."
@@ -1711,7 +1722,7 @@ else
   write_bootstrap_marker;
 fi;
 
-echo "СЂСџвЂњР‰ Setting up nftables traffic counters (IPv6-address based)..."
+echo "СЂСџвЂњР‰ Setting up nftables traffic counters (client-port based)..."
 setup_nftables_counters;
 
 echo "СЂСџС™Р‚ Starting proxy server..."
