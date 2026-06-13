@@ -9,6 +9,29 @@ const PROXY_CFG_DIR = path.join(PROXY_ROOT, "3proxy");
 const PROXY_BIN = path.join(PROXY_ROOT, "3proxy", "bin", "3proxy");
 const NFT_TABLE = "proxy_accounting";
 const COUNTER_NAME_RE = /^proxy_(\d+)_(in6|in|out)$/;
+// Grace before force-killing a 3proxy on disable. 3proxy treats SIGTERM as a
+// GRACEFUL shutdown — it stops accepting NEW connections but lets in-flight
+// ones run to completion. For pay-per-GB enforcement that let an active
+// download stream unbounded past the quota (revenue leak). We give SIGTERM a
+// short window to exit cleanly, then SIGKILL any survivor to sever the live
+// session. Overridable for tests via NODE_AGENT_DISABLE_GRACE_MS.
+const DISABLE_GRACE_MS = Number(process.env.NODE_AGENT_DISABLE_GRACE_MS || 2000);
+// Audit the active grace per node (phased rollout: un-patched nodes don't
+// force-kill, patched ones do — make each node's setting visible in the log).
+console.log(`[accounting] disable force-kill grace: DISABLE_GRACE_MS=${DISABLE_GRACE_MS}`);
+
+// Per-port disable "generation" token. disablePort and enablePort both bump it;
+// the deferred force-kill captures the token when armed and aborts if it has
+// since changed. Closes the critical race where an enablePort (rebuy / watchdog
+// reactivation) lands inside the grace window — without the guard the stale
+// SIGKILL would re-resolve the port's pids and kill the proxy the user JUST
+// paid to bring back. Bounded by the finite set of ports.
+const _disableGen = new Map();
+function _bumpDisableGen(port) {
+  const next = (_disableGen.get(port) || 0) + 1;
+  _disableGen.set(port, next);
+  return next;
+}
 
 class PortNotFoundError extends Error {
   constructor(port) {
@@ -143,6 +166,9 @@ async function disablePort(port) {
   if (!Number.isInteger(portNum) || portNum <= 0) {
     throw new PortNotFoundError(port);
   }
+  // Bump FIRST so any in-flight force-kill from a prior disable of this port
+  // (or a stale one superseded by a since-then enablePort) is invalidated.
+  const gen = _bumpDisableGen(portNum);
   const cfg = configPathForPort(portNum);
   const cfgExists = fs.existsSync(cfg);
   const pids = await findRunningPids(portNum);
@@ -166,6 +192,55 @@ async function disablePort(port) {
       }
     }
   }
+  // SIGTERM is graceful — 3proxy keeps an already-established connection (e.g.
+  // a large download) alive, which defeats pay-per-GB quota enforcement. After
+  // a short grace, force-kill any survivor. We RE-RESOLVE the pids for THIS
+  // port at kill time (not the captured list) so we never SIGKILL a recycled
+  // PID — pgrep on `3proxy_<port>.cfg` only matches a 3proxy still serving this
+  // exact port. The generation guard aborts if an enablePort/disablePort for
+  // this port ran in the meantime, so we never kill a freshly RE-ENABLED proxy
+  // (rebuy / watchdog reactivation inside the grace window). Fire-and-forget +
+  // unref so the disable ack returns now and the timer never keeps the agent
+  // (or a test) alive on its own.
+  if (DISABLE_GRACE_MS >= 0) {
+    const timer = setTimeout(() => {
+      if (_disableGen.get(portNum) !== gen) {
+        return; // superseded by a later enable/disable — do NOT kill.
+      }
+      findRunningPids(portNum)
+        .then((survivors) => {
+          if (_disableGen.get(portNum) !== gen) {
+            return; // re-check after the async pgrep hop.
+          }
+          let killed = 0;
+          for (const pid of survivors) {
+            try {
+              process.kill(pid, "SIGKILL");
+              killed += 1;
+            } catch (_err) {
+              // Already exited after the graceful SIGTERM — nothing to force.
+            }
+          }
+          if (killed > 0) {
+            console.log(
+              `[accounting.disablePort] force-killed ${killed} survivor(s) on port ${portNum} after ${DISABLE_GRACE_MS}ms grace`
+            );
+          }
+        })
+        .catch((err) => {
+          // A money-path enforcement primitive must NOT fail silently: the HTTP
+          // ack already returned "killed", so a swallowed error here means the
+          // survivor streams on with nobody the wiser. Log loudly; the next
+          // poll-cycle disable retry is the backstop.
+          console.error(
+            `[accounting.disablePort] force-kill check failed on port ${portNum}: ${
+              (err && err.message) || err
+            }`
+          );
+        });
+    }, DISABLE_GRACE_MS);
+    if (typeof timer.unref === "function") timer.unref();
+  }
   return { action: "killed", pids };
 }
 
@@ -174,6 +249,11 @@ async function enablePort(port) {
   if (!Number.isInteger(portNum) || portNum <= 0) {
     throw new PortNotFoundError(port);
   }
+  // Invalidate any pending force-kill from a recent disablePort of this port:
+  // re-enabling means we must NOT let a stale SIGKILL drop the proxy we're
+  // about to (re)spawn. Bump before spawning so the timer's generation check
+  // fails even if it fires mid-spawn.
+  _bumpDisableGen(portNum);
   const cfg = configPathForPort(portNum);
   if (!fs.existsSync(cfg)) {
     throw new PortNotFoundError(portNum);
@@ -209,4 +289,8 @@ module.exports = {
   PortNotFoundError,
   NftablesError,
   ProcessSpawnError,
+  // Exposed for the generation-guard unit test (no pgrep dependency).
+  _bumpDisableGen,
+  _disableGen,
+  DISABLE_GRACE_MS,
 };
