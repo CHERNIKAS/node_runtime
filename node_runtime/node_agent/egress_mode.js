@@ -35,6 +35,13 @@ const VALID_MODES = new Set(["ipv6_only", "dualstack"]);
 // Egress family flag per mode. dualstack = -64 (v4+v6), ipv6_only = -6.
 const FLAG_FOR_MODE = { dualstack: "-64", ipv6_only: "-6" };
 
+// 3proxy treats SIGTERM as GRACEFUL (it keeps in-flight connections alive and
+// HOLDS the listening socket until they drain). Mirror accounting.disablePort:
+// after SIGTERM wait this grace, then SIGKILL survivors so the -p<port> socket
+// is actually free before we respawn (same lesson as the metering SIGKILL fix).
+const EGRESS_RESTART_GRACE_MS = Number(process.env.EGRESS_RESTART_GRACE_MS) || 2000;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 class EgressModeError extends Error {
   constructor(message, detail) {
     super(message);
@@ -167,6 +174,29 @@ async function restartCfg(cfgPath) {
     } catch (err) {
       if (err && err.code !== "ESRCH") {
         throw new EgressModeError("kill_failed", String((err && err.message) || err));
+      }
+    }
+  }
+  // SIGTERM is graceful for 3proxy → it can keep the old process (and its
+  // listening socket) alive on a busy port, so the respawn below would fail to
+  // bind and the egress flip would silently not take effect. After a short
+  // grace, re-resolve and SIGKILL any survivor for this exact cfg (re-resolving
+  // avoids hitting a recycled PID) so the socket is guaranteed free on respawn.
+  if (pids.length) {
+    await sleep(EGRESS_RESTART_GRACE_MS);
+    let survivors;
+    try {
+      survivors = await findPidsForCfg(cfgPath);
+    } catch {
+      survivors = pids; // re-resolve failed — fall back to the signalled set
+    }
+    for (const pid of survivors) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (err) {
+        if (err && err.code !== "ESRCH") {
+          throw new EgressModeError("kill_failed", String((err && err.message) || err));
+        }
       }
     }
   }
