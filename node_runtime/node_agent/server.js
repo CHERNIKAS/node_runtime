@@ -8,6 +8,7 @@ const https = require("https");
 const dns = require("dns");
 const { buildDescribe } = require("./describe.js");
 const accounting = require("./accounting.js");
+const egressMode = require("./egress_mode.js");
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
 const API_KEY = String(process.env.NODE_AGENT_API_KEY || "").trim();
@@ -2902,6 +2903,46 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 500, {
         success: false,
         error: action === "disable" ? "disable_failed" : "enable_failed",
+        detail: String((err && err.message) || err),
+      });
+    }
+  }
+
+  // Wave EGRESS-TOGGLE — flip every 3proxy config on this node between
+  // dual-stack (-64) and ipv6-only (-6) egress, then restart the affected
+  // proxies. Driven fleet-wide by the orchestrator
+  // (POST /v1/admin/fleet/egress_mode), one button in the bot's «Ноды» menu.
+  if (req.method === "POST" && pathname === "/egress_mode") {
+    if (!ensureAuthorized(req)) {
+      return sendJson(res, 401, { success: false, error: "unauthorized" });
+    }
+    let body;
+    try {
+      body = await parseJsonBody(req);
+    } catch (err) {
+      return sendJson(res, 400, {
+        success: false,
+        error: "invalid_json",
+        detail: String((err && err.message) || err),
+      });
+    }
+    const mode = String((body && body.mode) || "").trim();
+    if (!egressMode.VALID_MODES.has(mode)) {
+      return sendJson(res, 400, {
+        success: false,
+        error: "invalid_mode",
+        detail: "mode must be one of: ipv6_only, dualstack",
+      });
+    }
+    try {
+      const result = await egressMode.applyEgressMode(mode);
+      // Contract response: { ok, mode, cfgs_rewritten, restarted } (+ errors[] on partial).
+      return sendJson(res, 200, result);
+    } catch (err) {
+      return sendJson(res, 500, {
+        success: false,
+        ok: false,
+        error: "egress_mode_failed",
         detail: String((err && err.message) || err),
       });
     }
