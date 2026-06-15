@@ -860,6 +860,202 @@ async function collectRunningInstances() {
   };
 }
 
+// Wave KILL-ON-REBIND — pure selection core: given the raw text of an `ss`
+// LISTEN dump and an inclusive target port range [low, high], return the sorted
+// list of pids that are listening on ANY port inside the range. Pure + exported
+// so the kill side-effects stay thin and unit-testable.
+//
+// Parses each line independently and tolerates junk: the local-address column
+// is whatever token contains the LISTEN row's address:port, the port is the
+// number after the LAST ':' in that token, and the pid comes from `pid=<n>`.
+// Lines without a usable port or pid are silently ignored.
+function selectPidsToKill(ssText, low, high) {
+  const lowN = Number(low);
+  const highN = Number(high);
+  if (!Number.isFinite(lowN) || !Number.isFinite(highN) || lowN > highN) {
+    return [];
+  }
+
+  const pidToPorts = new Map();
+  const text = typeof ssText === "string" ? ssText : "";
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+    // Only LISTEN rows describe a bound listener we might collide with.
+    if (!/\bLISTEN\b/.test(line)) {
+      continue;
+    }
+
+    // Local port = number after the LAST ':' in the local-address column.
+    // The local address is the first whitespace token that contains a ':'
+    // followed by digits at its end (covers 0.0.0.0:1080, [::]:1080, *:1080).
+    let port = 0;
+    for (const token of line.split(/\s+/)) {
+      const colonAt = token.lastIndexOf(":");
+      if (colonAt < 0) {
+        continue;
+      }
+      const portText = token.slice(colonAt + 1);
+      if (/^\d+$/.test(portText)) {
+        const candidate = Number(portText);
+        if (Number.isInteger(candidate) && candidate > 0) {
+          port = candidate;
+          break;
+        }
+      }
+    }
+    if (!port || port < lowN || port > highN) {
+      continue;
+    }
+
+    const pidMatch = line.match(/pid=(\d+)/);
+    if (!pidMatch) {
+      continue;
+    }
+    const pid = Number(pidMatch[1]);
+    if (!Number.isInteger(pid) || pid <= 0) {
+      continue;
+    }
+
+    let ports = pidToPorts.get(pid);
+    if (!ports) {
+      ports = new Set();
+      pidToPorts.set(pid, ports);
+    }
+    ports.add(port);
+  }
+
+  return Array.from(pidToPorts.keys()).sort((a, b) => a - b);
+}
+
+// Wave KILL-ON-REBIND — before a /generate, tear down any *stale* 3proxy
+// daemon that currently holds a TCP port the new generation is about to bind.
+// Two daemons on the same port → kernel SO_REUSEPORT load-balances accept()
+// → ~50% connection-refused. We run under the generation lock with the request
+// params known, so the kernel's live `ss` view is authoritative and race-free.
+//
+// Normal operation (allocator climbs monotonically, never reuses a port) → no
+// listener overlaps the new range → this is a complete no-op.
+async function killOverlappingListeners({ newStart, newCount }) {
+  const start = toPositiveInt(newStart, 0);
+  const count = toPositiveInt(newCount, 0);
+  if (!start || !count) {
+    return { ok: true, killedPids: [], targetRangeLow: 0, targetRangeHigh: 0 };
+  }
+
+  // socks range [start .. start+count-1]; in dual mode http listeners live at
+  // the same offsets minus 10000. We take the UNION as a single inclusive
+  // [low, high] span — selectPidsToKill only matches ports actually present in
+  // the ss dump, so widening the span over the gap is harmless.
+  const socksLow = start;
+  const socksHigh = start + count - 1;
+  const httpLow = Math.max(1, start - 10000);
+  const httpHigh = socksHigh - 10000;
+  const targetRangeLow = Math.min(socksLow, httpLow);
+  const targetRangeHigh = Math.max(socksHigh, httpHigh);
+
+  // Live kernel view: prefer -H (no header); fall back to header-bearing form.
+  let ssText = "";
+  let ssOk = false;
+  const ssH = await runCommand("ss", ["-tlnpH"], { timeoutSec: 8 });
+  if (ssH.ok) {
+    ssText = String(ssH.stdout || "");
+    ssOk = true;
+  } else {
+    const ssPlain = await runCommand("ss", ["-tlnp"], { timeoutSec: 8 });
+    if (ssPlain.ok) {
+      // Drop the header line (the only line containing "Local Address").
+      ssText = String(ssPlain.stdout || "")
+        .split(/\r?\n/)
+        .filter((l) => !/Local Address/i.test(l))
+        .join("\n");
+      ssOk = true;
+    }
+  }
+
+  if (!ssOk) {
+    // Never block a generation because ss failed — proceed without killing.
+    console.warn(
+      "[kill-on-rebind] ss failed; proceeding WITHOUT killing overlapping listeners",
+      { targetRangeLow, targetRangeHigh }
+    );
+    return { ok: false, killedPids: [], targetRangeLow, targetRangeHigh };
+  }
+
+  const candidatePids = selectPidsToKill(ssText, targetRangeLow, targetRangeHigh);
+  if (candidatePids.length === 0) {
+    // Normal case: nothing overlaps → complete no-op.
+    return { ok: true, killedPids: [], targetRangeLow, targetRangeHigh };
+  }
+
+  // SIGTERM the candidates, give them ~1500ms, then SIGKILL survivors.
+  for (const pid of candidatePids) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch (_error) {
+      // pid may already be gone — ignore.
+    }
+  }
+  await sleep(1500);
+  const killedPids = [];
+  for (const pid of candidatePids) {
+    if (isProcessAlive(pid)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (_error) {
+        // raced away between check and kill — ignore.
+      }
+    }
+    killedPids.push(pid);
+  }
+
+  // Cross-ref killed pids to their cfg paths and remove the now-stale generated
+  // files (cfg + startup script) using the file's own path helpers. If a cfg
+  // path is unknown we only log it for manual cleanup.
+  try {
+    const running = await collectRunningInstances();
+    if (running.ok) {
+      const cfgByPid = new Map();
+      for (const inst of running.instances) {
+        if (inst && Number.isInteger(inst.pid)) {
+          cfgByPid.set(inst.pid, inst);
+        }
+      }
+      for (const pid of killedPids) {
+        const inst = cfgByPid.get(pid);
+        const cfgPath = inst && inst.cfgPath ? inst.cfgPath : "";
+        const stalePort = inst ? toPositiveInt(inst.startPort, 0) : 0;
+        if (cfgPath && stalePort > 0) {
+          // Reconstruct via the canonical helpers so we never delete an
+          // unrelated path; only remove when it matches the parsed cfg.
+          const expectedCfg = buildCfgPathForStartPort(stalePort);
+          if (path.normalize(expectedCfg) === path.normalize(cfgPath)) {
+            await safeUnlink(expectedCfg);
+            await safeUnlink(buildStartupScriptPath(stalePort));
+          } else {
+            console.warn(
+              "[kill-on-rebind] stale cfg path mismatch; left for manual cleanup",
+              { pid, cfgPath, stalePort }
+            );
+          }
+        } else if (cfgPath) {
+          console.warn(
+            "[kill-on-rebind] killed pid with cfg but no start port; manual cleanup",
+            { pid, cfgPath }
+          );
+        }
+      }
+    }
+  } catch (_error) {
+    // Best-effort cleanup; killing already succeeded.
+  }
+
+  return { ok: true, killedPids, targetRangeLow, targetRangeHigh };
+}
+
 function buildInstanceSummary(instances) {
   const byCfg = new Map();
   const byStartPort = new Map();
@@ -2083,6 +2279,29 @@ async function handleGenerate(req, res) {
     return;
   }
 
+  // Wave KILL-ON-REBIND — under the generation lock, before any generation
+  // work: tear down stale 3proxy daemons holding ports this run will bind, so
+  // the kernel never SO_REUSEPORT-balances accept() across a stale + fresh
+  // listener (~50% connection-refused). No-op when nothing overlaps.
+  try {
+    const rebindResult = await killOverlappingListeners({
+      newStart: params.startPort,
+      newCount: params.proxyCount,
+    });
+    console.log("[kill-on-rebind]", {
+      jobId,
+      start_port: params.startPort,
+      ...rebindResult,
+    });
+  } catch (rebindError) {
+    // Never block a generation on the safety sweep.
+    console.warn("[kill-on-rebind] sweep error; proceeding with generation", {
+      jobId,
+      start_port: params.startPort,
+      error: rebindError && rebindError.message ? rebindError.message : String(rebindError),
+    });
+  }
+
   const runId = makeRunId();
   const jobDir = path.resolve(JOBS_ROOT, jobId);
   ensurePathInside(JOBS_ROOT, jobDir);
@@ -2970,6 +3189,8 @@ module.exports = {
   parseProxiesList,
   buildGeneratorArgs,
   collectJobParams,
+  // Wave KILL-ON-REBIND — pure pid-selection core exported for unit tests.
+  selectPidsToKill,
   // Wave NODE-NEW-MODERNIZE — exported so tests can assert the egress
   // policy default (strict_dual_stack) + env override.
   PRODUCTION_REQUIRED_IPV6_POLICY,
