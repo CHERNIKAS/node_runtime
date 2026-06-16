@@ -29,6 +29,10 @@ const { spawn } = require("child_process");
 
 const PROXY_ROOT = path.normalize(process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver");
 const PROXY_CFG_DIR = path.join(PROXY_ROOT, "3proxy");
+// Persisted current egress mode. The generation contract (server.js) reads this
+// so the required ipv6 policy FOLLOWS the toggle — making the egress switch
+// truly bidirectional (flipping existing proxies AND gating new generation).
+const EGRESS_MODE_STATE_PATH = path.join(PROXY_ROOT, "egress_mode.state");
 const PROXY_BIN = path.join(PROXY_ROOT, "3proxy", "bin", "3proxy");
 
 const VALID_MODES = new Set(["ipv6_only", "dualstack"]);
@@ -68,6 +72,27 @@ function flagForMode(mode) {
     throw new EgressModeError("invalid_mode", String(mode));
   }
   return flag;
+}
+
+// Persist the current egress mode atomically (write tmp + rename). Never throws:
+// the cfg rewrite/restart has already happened by the time we record state, so a
+// state-write failure is surfaced to the caller's error list, not raised.
+function persistEgressModeState(mode) {
+  const tmp = `${EGRESS_MODE_STATE_PATH}.tmp`;
+  fs.writeFileSync(tmp, `${mode}\n`, "utf-8");
+  fs.renameSync(tmp, EGRESS_MODE_STATE_PATH);
+}
+
+// Read the persisted egress mode. Returns the trimmed mode string when it is a
+// known VALID_MODES value, else null (missing / unreadable / malformed file).
+// Sync + cheap + never throws — safe to call on the generate path.
+function readEgressModeState() {
+  try {
+    const raw = fs.readFileSync(EGRESS_MODE_STATE_PATH, "utf-8").trim();
+    return VALID_MODES.has(raw) ? raw : null;
+  } catch {
+    return null;
+  }
 }
 
 // Rewrite the leading egress flag on every socks/proxy startup line of one
@@ -257,6 +282,16 @@ async function applyEgressMode(mode) {
   // (the contract's happy path). Per-cfg failures are surfaced in `errors`
   // without aborting the whole apply — the orchestrator collects per-node
   // ok/err and a partial restart still reports which configs need a retry.
+  // ALWAYS persist the mode (even when nothing was rewritten — a fresh node or
+  // idempotent re-apply must still record the current mode so the generation
+  // contract follows it). A write failure does NOT abort: the cfg rewrites have
+  // already happened, so it is reported in errors rather than thrown.
+  try {
+    persistEgressModeState(mode);
+  } catch (err) {
+    restartErrors.push({ cfg: "egress_mode.state", error: `state_write_failed: ${(err && err.message) || err}` });
+  }
+
   const result = {
     ok: restartErrors.length === 0,
     mode,
@@ -278,4 +313,8 @@ module.exports = {
   FLAG_FOR_MODE,
   EgressModeError,
   PROXY_CFG_DIR,
+  // Egress-mode state persistence — read by server.js so the generation
+  // contract follows the current toggle (bidirectional egress switch).
+  EGRESS_MODE_STATE_PATH,
+  readEgressModeState,
 };

@@ -46,6 +46,31 @@ const PRODUCTION_IPV6_ROLLOUT_STAGE = "enforced";
 const PRODUCTION_CLIENT_OS_PROFILE_ENFORCEMENT = "not_controlled_by_proxy";
 const PRODUCTION_EFFECTIVE_CLIENT_PROFILE = "not_controlled_by_proxy";
 
+// Wave EGRESS-TOGGLE (bidirectional) — the required ipv6 policy must FOLLOW the
+// current egress mode, not a module-load constant, so flipping egress to
+// ipv6_only also makes NEW generation require ipv6_only (and back). The mapping
+// is canonical: ipv6_only egress ⇒ ipv6_only policy, dualstack ⇒ strict_dual_stack.
+function requiredIpv6PolicyForMode(mode) {
+  if (mode === "ipv6_only") return "ipv6_only";
+  if (mode === "dualstack") return "strict_dual_stack";
+  return null;
+}
+
+// Current required ipv6 policy, derived from the persisted egress-mode state.
+// Sync, cheap, and exception-safe (it is called on the generate path): any
+// failure or missing/unknown state falls back to PRODUCTION_REQUIRED_IPV6_POLICY
+// (the env default), so a fresh node with no state file behaves EXACTLY as before.
+function currentRequiredIpv6Policy() {
+  try {
+    const mode = egressMode.readEgressModeState();
+    const policy = requiredIpv6PolicyForMode(mode);
+    if (policy) return policy;
+  } catch {
+    /* fall through to the constant */
+  }
+  return PRODUCTION_REQUIRED_IPV6_POLICY;
+}
+
 const SCRIPT_FLAG_CACHE = new Map();
 const PARTIAL_PATTERNS = [
   /\bpartial\b/i,
@@ -450,7 +475,7 @@ function evaluateProductProfileContract(params, profileDiagnostics) {
     actual_client_profile: PRODUCTION_EFFECTIVE_CLIENT_PROFILE,
     effective_client_os_profile: PRODUCTION_EFFECTIVE_CLIENT_PROFILE,
     network_profile: PRODUCTION_REQUIRED_NETWORK_PROFILE,
-    ipv6_policy: PRODUCTION_REQUIRED_IPV6_POLICY,
+    ipv6_policy: currentRequiredIpv6Policy(),
     ipv6_rollout_stage: PRODUCTION_IPV6_ROLLOUT_STAGE,
   };
 
@@ -500,13 +525,14 @@ function evaluateProductProfileContract(params, profileDiagnostics) {
     }
   }
 
+  const requiredIpv6Policy = currentRequiredIpv6Policy();
   for (const [field, actual] of [
     ["intended_ipv6_policy", profile.intended_ipv6_policy],
     ["effective_ipv6_policy", profile.effective_ipv6_policy],
     ["ipv6_policy", paramsObject.ipv6Policy],
   ]) {
-    if (normalizeContractValue(actual) !== PRODUCTION_REQUIRED_IPV6_POLICY) {
-      addMismatch(field, PRODUCTION_REQUIRED_IPV6_POLICY, actual);
+    if (normalizeContractValue(actual) !== requiredIpv6Policy) {
+      addMismatch(field, requiredIpv6Policy, actual);
     }
   }
 
@@ -2161,22 +2187,23 @@ async function handleGenerate(req, res) {
     ["ipv6_policy", body.ipv6_policy],
     ["generatorArgs.--ipv6-policy", getFlagValue(rawGeneratorArgs, ["--ipv6-policy"])],
   ];
+  const requiredIpv6Policy = currentRequiredIpv6Policy();
   for (const [source, value] of providedIpv6PolicyFields) {
     const policy = String(value ?? "").trim();
-    if (policy && normalizeContractValue(policy) !== PRODUCTION_REQUIRED_IPV6_POLICY) {
+    if (policy && normalizeContractValue(policy) !== requiredIpv6Policy) {
       sendJson(res, 400, {
         success: false,
         status: "failed",
         error: "ipv6_only_required",
         source,
-        expected: PRODUCTION_REQUIRED_IPV6_POLICY,
+        expected: requiredIpv6Policy,
         actual: policy,
       });
       return;
     }
   }
-  body.ipv6Policy = PRODUCTION_REQUIRED_IPV6_POLICY;
-  body.ipv6_policy = PRODUCTION_REQUIRED_IPV6_POLICY;
+  body.ipv6Policy = requiredIpv6Policy;
+  body.ipv6_policy = requiredIpv6Policy;
 
   const timeoutSec = Math.max(10, Number(body.timeoutSec || DEFAULT_TIMEOUT_SEC) || DEFAULT_TIMEOUT_SEC);
   const cwd = resolveInputPath(process.cwd(), body.cwd || process.cwd());
@@ -3194,4 +3221,8 @@ module.exports = {
   // Wave NODE-NEW-MODERNIZE — exported so tests can assert the egress
   // policy default (strict_dual_stack) + env override.
   PRODUCTION_REQUIRED_IPV6_POLICY,
+  // Wave EGRESS-TOGGLE (bidirectional) — the dynamic required-policy getter and
+  // its pure mode→policy mapping, exported for unit tests.
+  requiredIpv6PolicyForMode,
+  currentRequiredIpv6Policy,
 };
