@@ -97,6 +97,27 @@ function configPathForPort(port) {
   return path.join(PROXY_CFG_DIR, `3proxy_${port}.cfg`);
 }
 
+// Audit WI-5 (H16) — a disabled port whose cfg stays as `3proxy_<port>.cfg`
+// gets respawned by the reboot restore scripts (which glob `3proxy_*.cfg`),
+// silently reviving a depleted/disabled pay-per-GB port. Demoting renames the
+// cfg to `3proxy_<port>.cfg.disabled` (NOT matched by the glob); enablePort
+// promotes it back to the live name.
+function disabledConfigPathForPort(port) {
+  return path.join(PROXY_CFG_DIR, `3proxy_${port}.cfg.disabled`);
+}
+
+function _demoteCfg(cfg, portNum) {
+  // Rename the live cfg out of the restore glob. ENOENT = a concurrent disable
+  // already moved it (no-op); anything else is a real failure.
+  try {
+    fs.renameSync(cfg, disabledConfigPathForPort(portNum));
+  } catch (err) {
+    if (err && err.code === "ENOENT") return false;
+    throw new ProcessSpawnError("cfg_disable_rename_failed", String((err && err.message) || err));
+  }
+  return true;
+}
+
 async function findRunningPids(port) {
   const pattern = `3proxy_${port}.cfg`;
   const result = await execCapture("pgrep", ["-f", pattern]);
@@ -184,8 +205,12 @@ async function disablePort(port) {
       if (!counters[String(portNum)]) {
         throw new PortNotFoundError(portNum);
       }
+      return { action: "already_disabled" };
     }
-    return { action: "already_disabled" };
+    // Audit WI-5 (H16) — no live proxy, but the cfg is still in the restore
+    // glob; a reboot would revive this disabled port. Demote so restore skips it.
+    _demoteCfg(cfg, portNum);
+    return { action: "already_disabled", cfgDisabled: true };
   }
 
   for (const pid of pids) {
@@ -196,6 +221,11 @@ async function disablePort(port) {
         throw new ProcessSpawnError("kill_failed", String(err && err.message || err));
       }
     }
+  }
+  // Audit WI-5 (H16) — demote the cfg so a reboot's restore glob skips this
+  // port, even while the async force-kill below is still draining survivors.
+  if (cfgExists) {
+    _demoteCfg(cfg, portNum);
   }
   // SIGTERM is graceful — 3proxy keeps an already-established connection (e.g.
   // a large download) alive, which defeats pay-per-GB quota enforcement. After
@@ -260,6 +290,12 @@ async function enablePort(port) {
   // fails even if it fires mid-spawn.
   _bumpDisableGen(portNum);
   const cfg = configPathForPort(portNum);
+  // Audit WI-5 (H16) — promote a previously-demoted cfg back to the live name
+  // so spawn, the reboot restore glob, and pgrep all agree on `3proxy_<port>.cfg`.
+  const disabledCfg = disabledConfigPathForPort(portNum);
+  if (!fs.existsSync(cfg) && fs.existsSync(disabledCfg)) {
+    fs.renameSync(disabledCfg, cfg);
+  }
   if (!fs.existsSync(cfg)) {
     throw new PortNotFoundError(portNum);
   }
@@ -298,4 +334,8 @@ module.exports = {
   _bumpDisableGen,
   _disableGen,
   DISABLE_GRACE_MS,
+  // Audit WI-5 (H16) — cfg demote/promote lifecycle, exported for unit tests.
+  configPathForPort,
+  disabledConfigPathForPort,
+  _demoteCfg,
 };
