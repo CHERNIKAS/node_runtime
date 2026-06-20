@@ -18,6 +18,15 @@ Environment=NODE_AGENT_REQUIRED_IPV6_POLICY=strict_dual_stack
 ExecStart=/usr/bin/node /opt/netrun/node_runtime/node_agent/server.js
 Restart=always
 RestartSec=3
+# KillMode=process (Wave node-genlock-hardening): on stop/restart, only the
+# agent process is signalled — the 3proxy daemons it spawned during generation
+# (same cgroup, reparented to init) are LEFT RUNNING. The default
+# control-group would kill the entire cgroup, tearing down every agent-spawned
+# 3proxy on any agent restart/code-deploy (verified live: a restart dropped a
+# node from 52→8 listeners, a partial proxy outage until the restore unit
+# relaunched them). Restore-unit-owned 3proxy already survive; this makes the
+# agent restart non-destructive too.
+KillMode=process
 # Raised limits (incident 2026-05-18): 4000+ 3proxy children need infinity.
 # Default TasksMax=32768 caused fork-rejected → node hangs. install_node_v2.sh
 # also lays a drop-in override; this is the baseline so a bare template is safe too.

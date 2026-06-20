@@ -391,6 +391,11 @@ install_systemd_service() {
 TasksMax=infinity
 LimitNOFILE=1048576
 LimitNPROC=infinity
+# KillMode=process: don't tear down agent-spawned 3proxy on agent restart /
+# code-deploy (default control-group kills the whole cgroup → partial proxy
+# outage until the restore unit relaunches them). Restore-unit 3proxy already
+# survive; this makes the agent restart non-destructive for generated ones too.
+KillMode=process
 EOF
 
   systemctl daemon-reload
