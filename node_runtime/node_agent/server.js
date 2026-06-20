@@ -19,6 +19,11 @@ const LOCK_FILENAME = ".generation.lock";
 const LOG_TAIL_LIMIT = 12000;
 const RESPONSE_TAIL_LIMIT = 2000;
 const DEFAULT_STALE_JOB_SEC = Math.max(60, Number(process.env.NODE_AGENT_STALE_JOB_SEC || 1800));
+// Wave NODE-GENLOCK-HARDENING — a generation lock older than this is treated
+// as abandoned (the generating process died without releasing it, or the lock
+// file was left empty/corrupt by a crash mid-write). Generation jobs are short,
+// so 30 min is a safe ceiling; tunable via env.
+const STALE_LOCK_MS = Math.max(60_000, Number(process.env.NODE_AGENT_STALE_LOCK_SEC || 1800) * 1000);
 const DEFAULT_AUTH_CHECK_SAMPLES = Math.max(1, Number(process.env.NODE_AGENT_AUTH_CHECK_SAMPLES || 3));
 const DEFAULT_AUTH_CHECK_TIMEOUT_MS = Math.max(1000, Number(process.env.NODE_AGENT_AUTH_CHECK_TIMEOUT_MS || 5000));
 const DEFAULT_INSTANCE_WAIT_MS = Math.max(2000, Number(process.env.NODE_AGENT_INSTANCE_WAIT_MS || 12000));
@@ -1741,6 +1746,73 @@ async function buildReconcileReport(staleJobSec = DEFAULT_STALE_JOB_SEC) {
   };
 }
 
+// Wave NODE-GENLOCK-HARDENING — pure staleness verdict for a generation lock.
+// A lock is STALE (safe to steal) when any of:
+//   - the file is missing/empty/unparseable (parsed === null) — a crash between
+//     open('wx') and writeFile leaves a 0-byte file that bricks generation;
+//   - the recorded pid is no longer alive;
+//   - the lock is older than ttlMs (by acquiredAt, falling back to file mtime).
+// It is LIVE (must report busy / refuse) only when it parses, the pid is alive,
+// AND it is within the TTL window. `now`, `pidAlive`, and `fileMtimeMs` are
+// injected so this stays deterministic and unit-testable without a filesystem.
+function isGenerationLockStale(parsed, { now, ttlMs, pidAlive, fileMtimeMs } = {}) {
+  // Missing / empty / corrupt lock file → reclaimable.
+  if (!parsed || typeof parsed !== "object") {
+    return true;
+  }
+  // A genuinely running generation must keep us out.
+  if (pidAlive) {
+    // Still enforce the TTL as a backstop against a pid that was recycled by
+    // an unrelated long-lived process: an ancient "live" lock is abandoned.
+    const ageBaseMs = lockAgeBaseMs(parsed, fileMtimeMs);
+    if (ageBaseMs !== null && Number.isFinite(now) && now - ageBaseMs > ttlMs) {
+      return true;
+    }
+    return false;
+  }
+  // pid is dead (or unknown) → stale regardless of age.
+  return true;
+}
+
+// Resolve the timestamp a lock's age should be measured from: prefer the
+// recorded acquiredAt, fall back to the file's mtime. Returns null when neither
+// is usable (age cannot be established → callers must not expire on age alone).
+function lockAgeBaseMs(parsed, fileMtimeMs) {
+  if (parsed && parsed.acquiredAt) {
+    const t = Date.parse(parsed.acquiredAt);
+    if (Number.isFinite(t)) {
+      return t;
+    }
+  }
+  if (Number.isFinite(fileMtimeMs)) {
+    return fileMtimeMs;
+  }
+  return null;
+}
+
+// Read a generation lock file and classify it (parsed record + staleness).
+// Returns { parsed, stale, pidAlive }. `parsed` is null for missing/empty/
+// corrupt files (the prod-bricking case). Shared by acquire + /health so both
+// agree on what "busy" means.
+async function classifyGenerationLock(lockPath, ttlMs = STALE_LOCK_MS) {
+  const parsed = await readJsonIfExists(lockPath);
+  let fileMtimeMs;
+  try {
+    const st = await fsp.stat(lockPath);
+    fileMtimeMs = st.mtimeMs;
+  } catch (_error) {
+    fileMtimeMs = undefined;
+  }
+  const pidAlive = parsed ? isProcessAlive(Number(parsed.pid || 0)) : false;
+  const stale = isGenerationLockStale(parsed, {
+    now: Date.now(),
+    ttlMs,
+    pidAlive,
+    fileMtimeMs,
+  });
+  return { parsed, stale, pidAlive };
+}
+
 async function acquireGenerationLock(lockPath, payload) {
   await fsp.mkdir(path.dirname(lockPath), { recursive: true });
   const ownerToken = makeRunId();
@@ -1773,15 +1845,30 @@ async function acquireGenerationLock(lockPath, payload) {
     return { ok: true, lockRecord: record };
   }
 
-  let existingLock = await readJsonIfExists(lockPath);
-  if (existingLock && !isProcessAlive(Number(existingLock.pid || 0))) {
+  // The exclusive create failed: a lock file already exists. Decide whether it
+  // belongs to a live generation (refuse) or is stale and reclaimable. A stale
+  // lock includes the prod-observed empty/corrupt 0-byte file, a dead pid, and
+  // a lock past its TTL — all of which previously bricked the node on /generate.
+  // Bound the steal+retry so a pathological re-create loop cannot spin forever.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const { parsed, stale } = await classifyGenerationLock(lockPath);
+    if (!stale) {
+      return { ok: false, existingLock: parsed || null };
+    }
     await safeUnlink(lockPath);
+    // Re-stat after unlink before claiming: if a competing generation won the
+    // race and created a *fresh* live lock in the gap, do not steal it.
+    const after = await classifyGenerationLock(lockPath);
+    if (after.parsed && !after.stale) {
+      return { ok: false, existingLock: after.parsed };
+    }
     if (await tryAcquire()) {
       return { ok: true, lockRecord: record, staleLockRecovered: true };
     }
-    existingLock = await readJsonIfExists(lockPath);
+    // Lost the create race to someone else — loop re-evaluates the new lock.
   }
-  return { ok: false, existingLock: existingLock || null };
+  const finalParsed = await readJsonIfExists(lockPath);
+  return { ok: false, existingLock: finalParsed || null };
 }
 
 async function releaseGenerationLock(lockPath, ownerToken) {
@@ -2989,7 +3076,11 @@ async function handleReconcile(req, res) {
 async function handleHealth(req, res) {
   await fsp.mkdir(JOBS_ROOT, { recursive: true });
   const lockPath = path.join(JOBS_ROOT, LOCK_FILENAME);
-  const lock = await readJsonIfExists(lockPath);
+  // Wave NODE-GENLOCK-HARDENING — report busy via the same staleness verdict
+  // acquireGenerationLock uses, so /health never claims busy on an empty/dead/
+  // expired lock that /generate would happily reclaim (the prod inconsistency).
+  const lockState = await classifyGenerationLock(lockPath);
+  const busy = Boolean(lockState.parsed) && !lockState.stale;
   const instancesState = await collectRunningInstances();
   const instances = instancesState.instances || [];
   const summary = buildInstanceSummary(instances);
@@ -3025,7 +3116,7 @@ async function handleHealth(req, res) {
     agentAlive: true,
     timestamp: nowIso(),
     jobsRoot: JOBS_ROOT,
-    busy: Boolean(lock),
+    busy,
     activeInstances: summary.count,
     duplicateStatePresent: summary.duplicateStatePresent,
     instances: instancesPayload,
@@ -3225,4 +3316,12 @@ module.exports = {
   // its pure mode→policy mapping, exported for unit tests.
   requiredIpv6PolicyForMode,
   currentRequiredIpv6Policy,
+  // Wave NODE-GENLOCK-HARDENING — generation-lock staleness core + filesystem
+  // wrappers, exported so tests can reproduce the stale/empty-lock bug and
+  // assert acquire recovery + /health busy alignment.
+  isGenerationLockStale,
+  classifyGenerationLock,
+  acquireGenerationLock,
+  releaseGenerationLock,
+  STALE_LOCK_MS,
 };
