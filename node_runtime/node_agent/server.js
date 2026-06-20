@@ -1121,6 +1121,66 @@ function buildInstanceSummary(instances) {
   };
 }
 
+// Wave NODE-GENLOCK-HARDENING — pure 3proxy readiness verdict for /health.
+// Distinguishes "agent up but 3proxy not listening yet" (the freshly-booted
+// window where the orchestrator must NOT mass-invalidate proxies) from
+// "agent up and 3proxy actually serving". A running 3proxy *process* is not
+// enough — its listener must be bound. We cross-check each instance's startPort
+// against the set of ports actually in LISTEN.
+//
+// `instances` = collectRunningInstances().instances; `listeningPorts` = a Set
+// (or array) of currently-listening TCP ports; `portsOk` = whether the ss probe
+// that produced listeningPorts succeeded. Pure + exported for unit tests.
+//
+// ready iff: ss succeeded, ≥1 instance, and every instance with a known
+// startPort is listening. When ss failed we cannot prove readiness → not ready
+// (but flag unknown so the orchestrator can treat it as inconclusive, not as a
+// hard "tear everything down").
+function computeProxyReadiness(instances, listeningPorts, portsOk = true) {
+  const list = Array.isArray(instances) ? instances : [];
+  const portSet =
+    listeningPorts instanceof Set
+      ? listeningPorts
+      : new Set(Array.isArray(listeningPorts) ? listeningPorts.map((p) => Number(p)) : []);
+
+  const instanceCount = list.length;
+  let withKnownPort = 0;
+  let listening = 0;
+  for (const inst of list) {
+    const startPort = toPositiveInt(inst && inst.startPort, 0);
+    if (startPort <= 0) {
+      continue; // unparseable startPort — cannot port-match this instance.
+    }
+    withKnownPort += 1;
+    if (portSet.has(startPort)) {
+      listening += 1;
+    }
+  }
+
+  const probeOk = Boolean(portsOk);
+  let ready;
+  if (!probeOk) {
+    ready = false; // could not observe listeners → cannot assert readiness.
+  } else if (instanceCount === 0) {
+    ready = false; // no 3proxy running yet (the boot window).
+  } else if (withKnownPort === 0) {
+    // Instances exist but none expose a parseable startPort; fall back to the
+    // weaker "at least one proxy-range port is listening" signal.
+    ready = listening > 0 || portSet.size > 0;
+  } else {
+    ready = listening >= withKnownPort;
+  }
+
+  return {
+    ready,
+    probeOk,
+    instanceCount,
+    instancesWithKnownPort: withKnownPort,
+    instancesListening: listening,
+    listeningPortCount: portSet.size,
+  };
+}
+
 async function listListeningTcpPorts() {
   const out = new Set();
   const ss = await runCommand("ss", ["-ltnH"], { timeoutSec: 8 });
@@ -3084,12 +3144,21 @@ async function handleHealth(req, res) {
   const instancesState = await collectRunningInstances();
   const instances = instancesState.instances || [];
   const summary = buildInstanceSummary(instances);
-  // Fan out ipv6 + dns probes in parallel — each carries its own
-  // ~5s budget, so wall-clock stays bounded by max(probe), not sum.
-  const [ipv6Check, dnsCheck] = await Promise.all([
+  // Fan out ipv6 + dns + listening-port probes in parallel — each carries its
+  // own ~5s budget, so wall-clock stays bounded by max(probe), not sum.
+  const [ipv6Check, dnsCheck, listenState] = await Promise.all([
     checkIpv6Egress(DEFAULT_IPV6_EGRESS_URL, 5000),
     checkDns(5000),
+    listListeningTcpPorts(),
   ]);
+  // Wave NODE-GENLOCK-HARDENING — 3proxy readiness, additive. Lets the
+  // orchestrator distinguish "agent up but 3proxy not listening yet" (fresh
+  // boot — do NOT mass-invalidate proxies) from "agent up and serving".
+  const proxyReadiness = computeProxyReadiness(
+    instances,
+    listenState.ports,
+    listenState.ok
+  );
   const success = Boolean(instancesState.ok);
   const status = success ? "ready" : "failed";
   const ipv6 = {
@@ -3119,6 +3188,18 @@ async function handleHealth(req, res) {
     busy,
     activeInstances: summary.count,
     duplicateStatePresent: summary.duplicateStatePresent,
+    // Wave NODE-GENLOCK-HARDENING — additive 3proxy readiness. Top-level flat
+    // field for cheap orchestrator checks; full detail under proxyReadiness.
+    proxyReady: proxyReadiness.ready,
+    proxyReadiness: {
+      ready: proxyReadiness.ready,
+      probeOk: proxyReadiness.probeOk,
+      probeError: listenState.ok ? null : listenState.error || "ss_failed",
+      instanceCount: proxyReadiness.instanceCount,
+      instancesWithKnownPort: proxyReadiness.instancesWithKnownPort,
+      instancesListening: proxyReadiness.instancesListening,
+      listeningPortCount: proxyReadiness.listeningPortCount,
+    },
     instances: instancesPayload,
     ipv6,
     ipv6Egress: ipv6,
@@ -3324,4 +3405,7 @@ module.exports = {
   acquireGenerationLock,
   releaseGenerationLock,
   STALE_LOCK_MS,
+  // Wave NODE-GENLOCK-HARDENING — pure 3proxy readiness verdict for /health,
+  // exported for unit tests.
+  computeProxyReadiness,
 };
