@@ -2,7 +2,7 @@
 # Wave HTTP.A — tests for the generator dual-proxy mode. Extracts the
 # actual write_* functions from proxyyy_automated.sh and runs them with
 # controlled globals (no 3proxy / network needed). Run with:
-#   bash node_runtime/generator/test_http_a_dual.sh
+#   bash node_runtime/soft/generator/test_http_a_dual.sh
 set -euo pipefail
 
 GEN="$(dirname "$0")/proxyyy_automated.sh"
