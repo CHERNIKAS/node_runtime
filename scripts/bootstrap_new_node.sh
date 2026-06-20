@@ -14,7 +14,7 @@
 #
 # What it does:
 #   1. scp the entire node_runtime/ to /tmp/netrun-source/ on the node
-#   2. ssh: bash install_node.sh (which: hardens system, installs node-agent,
+#   2. ssh: bash install_node_v2.sh (which: hardens system, installs node-agent,
 #      sets up auto-restore service, pins DNS, disables UFW, etc.)
 #   3. ssh: run netrun-doctor.sh to verify all green
 #   4. Print enrollment command to register the node in orchestrator
@@ -68,11 +68,11 @@ tar -C "$REPO_ROOT" --exclude='./.git' --exclude='./node_modules' -czf - . \
   | ssh -o StrictHostKeyChecking=no "root@$NODE_IP" 'tar -C /tmp/netrun-source -xzf -'
 ok "Source copied"
 
-# === 3. Run install_node.sh ===
-log "3/5 Running install_node.sh on node (hardening + node-agent install)"
+# === 3. Run install_node_v2.sh ===
+log "3/5 Running install_node_v2.sh on node (hardening + node-agent install)"
 log "    (this takes 1-3 minutes; ssh logs streamed below)"
-ssh -o StrictHostKeyChecking=no "root@$NODE_IP" 'cd /tmp/netrun-source && bash install_node.sh'
-ok "install_node.sh finished"
+ssh -o StrictHostKeyChecking=no "root@$NODE_IP" 'cd /tmp/netrun-source && bash install_node_v2.sh'
+ok "install_node_v2.sh finished"
 
 # === 4. Run netrun-doctor.sh ===
 log "4/5 Running netrun-doctor.sh diagnostic"

@@ -13,7 +13,7 @@
 # What it does (in order):
 #   1. Updates apt, installs git/curl/jq
 #   2. Clones https://github.com/Tmwyw/node_runtime_new → /tmp/netrun-source
-#   3. Runs install_node.sh (UFW purge + DNS pin + sysctl tune + node-agent + 3proxy-restore + doctor)
+#   3. Runs install_node_v2.sh (UFW purge + DNS pin + sysctl tune + node-agent + 3proxy-restore + doctor)
 #   4. Verifies node-agent /health returns 200
 #   5. Registers the node with orchestrator via POST /v1/nodes/enroll
 #   6. Prints SKU-binding SQL the operator needs to run on orchestrator
@@ -106,12 +106,12 @@ rm -rf /tmp/netrun-source
 git clone --depth=1 --branch "$REPO_BRANCH" "$REPO_URL" /tmp/netrun-source
 ok "source cloned"
 
-# === 3. Run install_node.sh ===
-log "3/6 Running install_node.sh (hardening + node-agent install)"
-log "    UFW purge + DNS pin + sysctl tune + FD limits + 3proxy-restore + MSS=1340"
+# === 3. Run install_node_v2.sh ===
+log "3/6 Running install_node_v2.sh (hardening + node-agent install)"
+log "    UFW purge + DNS pin + sysctl tune + FD limits + 3proxy-restore + MSS=1460"
 cd /tmp/netrun-source
-bash install_node.sh
-ok "install_node.sh finished"
+bash install_node_v2.sh
+ok "install_node_v2.sh finished"
 
 # === 4. Verify /health ===
 log "4/6 Verifying node-agent /health"

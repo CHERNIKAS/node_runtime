@@ -7,8 +7,13 @@ Self-contained NETRUN proxy node runtime. This repo is only for the node-agent a
 ```bash
 git clone https://github.com/Tmwyw/node_runtime_new.git /opt/netrun
 cd /opt/netrun
-bash install_node.sh
+bash install_node_v2.sh
 ```
+
+> `install_node_v2.sh` is the maintained installer (raised kernel pid/thread
+> limits, DAD/MLD off, bounded 3proxy restore, MSS 1460, unbound resolver,
+> trend + IPv6-egress restore units). `install_node.sh` is now a thin shim that
+> execs v2, so either filename works on a fresh node.
 
 ## Archive Install
 
@@ -18,7 +23,7 @@ ssh root@server
 cd /opt
 tar -xzf netrun-node.tar.gz
 cd netrun-node
-bash install_node.sh
+bash install_node_v2.sh
 ```
 
 The installer copies the archive contents into `/opt/netrun` and installs the systemd service from there. It does not require `.git` and does not run git commands.
@@ -27,10 +32,10 @@ The installer copies the archive contents into `/opt/netrun` and installs the sy
 
 ```bash
 bash scripts/clean_node.sh --remove-legacy-root
-bash install_node.sh
+bash install_node_v2.sh
 ```
 
-`install_node.sh --clean --remove-legacy-root` is also supported when you explicitly want cleanup before install.
+`install_node_v2.sh --clean --remove-legacy-root` is also supported when you explicitly want cleanup before install.
 
 ## Health Check
 
