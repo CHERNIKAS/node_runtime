@@ -962,6 +962,35 @@ function selectPidsToKill(ssText, low, high) {
   return Array.from(pidToPorts.keys()).sort((a, b) => a - b);
 }
 
+// Wave KILL-ON-REBIND (gap-safe) — given the ss dump and a generation's
+// (start, count), return the pids to kill: those listening on the socks range
+// [start .. start+count-1] OR the paired dual-mode http range
+// [start-10000 .. start+count-1-10000]. These are TWO DISJOINT ranges; the
+// span between httpHigh and socksLow belongs to *other* (prior, still-valid)
+// batches and MUST NOT be matched. Earlier code collapsed both into a single
+// [min(low), max(high)] span and so killed every prior batch sitting in that
+// gap — wiping live, already-validated inventory on each refill. Matching each
+// range independently against one ss snapshot keeps the no-op fast path and
+// never touches the gap. Pure + exported for unit tests.
+function selectGenerationRebindPids(ssText, newStart, newCount) {
+  const start = toPositiveInt(newStart, 0);
+  const count = toPositiveInt(newCount, 0);
+  if (!start || !count) {
+    return [];
+  }
+  const socksLow = start;
+  const socksHigh = start + count - 1;
+  const httpLow = Math.max(1, start - 10000);
+  const httpHigh = socksHigh - 10000;
+  const pids = new Set(selectPidsToKill(ssText, socksLow, socksHigh));
+  if (httpHigh >= httpLow) {
+    for (const pid of selectPidsToKill(ssText, httpLow, httpHigh)) {
+      pids.add(pid);
+    }
+  }
+  return Array.from(pids).sort((a, b) => a - b);
+}
+
 // Wave KILL-ON-REBIND — before a /generate, tear down any *stale* 3proxy
 // daemon that currently holds a TCP port the new generation is about to bind.
 // Two daemons on the same port → kernel SO_REUSEPORT load-balances accept()
@@ -977,10 +1006,11 @@ async function killOverlappingListeners({ newStart, newCount }) {
     return { ok: true, killedPids: [], targetRangeLow: 0, targetRangeHigh: 0 };
   }
 
-  // socks range [start .. start+count-1]; in dual mode http listeners live at
-  // the same offsets minus 10000. We take the UNION as a single inclusive
-  // [low, high] span — selectPidsToKill only matches ports actually present in
-  // the ss dump, so widening the span over the gap is harmless.
+  // socks range [start .. start+count-1] and the paired dual-mode http range
+  // (same offsets minus 10000) are matched INDEPENDENTLY — see
+  // selectGenerationRebindPids. The reported [low, high] below is for logging
+  // only; we deliberately do NOT match the gap between the two ranges, which
+  // holds other live batches. (A single [min,max] span here used to kill them.)
   const socksLow = start;
   const socksHigh = start + count - 1;
   const httpLow = Math.max(1, start - 10000);
@@ -1016,7 +1046,7 @@ async function killOverlappingListeners({ newStart, newCount }) {
     return { ok: false, killedPids: [], targetRangeLow, targetRangeHigh };
   }
 
-  const candidatePids = selectPidsToKill(ssText, targetRangeLow, targetRangeHigh);
+  const candidatePids = selectGenerationRebindPids(ssText, start, count);
   if (candidatePids.length === 0) {
     // Normal case: nothing overlaps → complete no-op.
     return { ok: true, killedPids: [], targetRangeLow, targetRangeHigh };
@@ -3390,6 +3420,9 @@ module.exports = {
   collectJobParams,
   // Wave KILL-ON-REBIND — pure pid-selection core exported for unit tests.
   selectPidsToKill,
+  // Wave KILL-ON-REBIND (gap-safe) — two-range generation selector that never
+  // matches the gap between the socks + paired http ranges. Exported for tests.
+  selectGenerationRebindPids,
   // Wave NODE-NEW-MODERNIZE — exported so tests can assert the egress
   // policy default (strict_dual_stack) + env override.
   PRODUCTION_REQUIRED_IPV6_POLICY,

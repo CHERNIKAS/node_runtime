@@ -10,7 +10,7 @@
 const assert = require("assert");
 const path = require("path");
 
-const { selectPidsToKill } = require(path.resolve(__dirname, "server.js"));
+const { selectPidsToKill, selectGenerationRebindPids } = require(path.resolve(__dirname, "server.js"));
 
 let passed = 0;
 function ok(cond, msg) {
@@ -80,5 +80,61 @@ function row(addr, pid) {
   eq(selectPidsToKill(two, 1080, 1083), [3, 9], "h: result sorted ascending by pid");
 }
 
+// === selectGenerationRebindPids — the two-range, gap-safe generation selector ===
+// REGRESSION: a single [min,max] span used to kill prior batches sitting in the
+// gap between the new generation's http range and its socks range. These tests
+// pin that the gap is never matched while both real ranges still are.
+
+// (i) THE BUG: new generation socks=[32800..32999], http=[22800..22999].
+// A prior valid batch listens on socks 32000 (pid 100) + its http 22000 (101) —
+// BOTH live in the gap (22999 < port < 32800) and MUST survive.
+{
+  const text = [
+    row("0.0.0.0:32000", 100), // prior batch socks — in the gap
+    row("0.0.0.0:22000", 101), // prior batch http  — in the gap
+    row("0.0.0.0:32800", 200), // new batch socks   — MUST be killed
+    row("0.0.0.0:22800", 201), // new batch http    — MUST be killed
+  ].join("\n");
+  eq(
+    selectGenerationRebindPids(text, 32800, 200),
+    [200, 201],
+    "i: gap-resident prior batch (32000/22000) survives; only new socks+http ranges killed"
+  );
+}
+
+// (ii) the OLD wide span [22800..32999] would have matched the gap listener —
+// prove selectPidsToKill (single span) still does, so we know the fix lives in
+// the caller, not the pure core.
+{
+  const text = [row("0.0.0.0:32000", 100)].join("\n");
+  eq(selectPidsToKill(text, 22800, 32999), [100], "ii: wide span still matches gap (old behavior pinned)");
+  eq(selectGenerationRebindPids(text, 32800, 200), [], "ii: gap-safe selector does NOT match the gap listener");
+}
+
+// (iii) boundaries of both ranges are inclusive; just-outside is excluded.
+{
+  const text = [
+    row("0.0.0.0:32999", 1), // socksHigh — in
+    row("0.0.0.0:33000", 2), // socksHigh+1 — out
+    row("0.0.0.0:22999", 3), // httpHigh — in
+    row("0.0.0.0:22799", 4), // httpLow-1 — out
+  ].join("\n");
+  eq(selectGenerationRebindPids(text, 32800, 200), [1, 3], "iii: range edges inclusive, just-outside excluded");
+}
+
+// (iv) low-start generation where http range underflows (httpHigh < httpLow):
+// only the socks range is matched, no crash.
+{
+  const text = [row("0.0.0.0:1080", 9), row("0.0.0.0:5000", 8)].join("\n");
+  eq(selectGenerationRebindPids(text, 1080, 4), [9], "iv: http range skipped when it underflows; socks still matched");
+}
+
+// (v) zero/invalid args → empty (mirrors killOverlappingListeners guard).
+{
+  eq(selectGenerationRebindPids("anything", 0, 200), [], "v1: zero start → empty");
+  eq(selectGenerationRebindPids("anything", 32800, 0), [], "v2: zero count → empty");
+}
+
 ok(true, "module exported selectPidsToKill");
+ok(typeof selectGenerationRebindPids === "function", "module exported selectGenerationRebindPids");
 console.log(`server.kill_on_rebind.test.js — all ${passed} assertions passed`);
