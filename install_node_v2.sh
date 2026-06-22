@@ -364,6 +364,25 @@ write_bootstrap_marker() {
 EOF
 }
 
+# === Wave EGRESS-STATE-SEED: a fresh node MUST ship an egress_mode.state, else
+# the agent falls back to its env default (NODE_AGENT_REQUIRED_IPV6_POLICY,
+# i.e. strict_dual_stack) while the orchestrator's production profile sends
+# ipv6_only → policy mismatch → EVERY /generate fails with
+# {"error":"ipv6_only_required"} and the node never mints a single proxy. This
+# was the silent root cause of fresh / re-imaged nodes not generating. Seed
+# ipv6_only (the production egress policy). Preserve a non-empty existing file —
+# an admin may have intentionally selected a different egress mode (e.g. a
+# dualstack pool); we only fill the gap, never clobber a deliberate choice. ===
+seed_egress_mode_state() {
+  local state_file="$PROXY_ROOT/egress_mode.state"
+  if [ -s "$state_file" ]; then
+    log "egress_mode.state present (= $(cat "$state_file" 2>/dev/null)) — keeping"
+  else
+    printf 'ipv6_only' > "$state_file"
+    log "Seeded egress_mode.state=ipv6_only (fresh-node generation default)"
+  fi
+}
+
 ensure_legacy_root_proxyserver_symlink() {
   log "Linking /root/proxyserver -> $PROXY_ROOT (legacy script compat)"
   if [ -e /root/proxyserver ] && [ ! -L /root/proxyserver ]; then
@@ -643,6 +662,7 @@ main() {
   configure_sysctl
   configure_nftables
   write_bootstrap_marker
+  seed_egress_mode_state
   ensure_legacy_root_proxyserver_symlink
   install_systemd_service
 
