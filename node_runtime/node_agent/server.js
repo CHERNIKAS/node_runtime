@@ -3408,6 +3408,14 @@ if (require.main === module) {
     console.log(
       `[node-agent] listening on :${PORT}, jobs_root=${JOBS_ROOT}, proxy_root=${PROXY_ROOT}, cron_cleanup=${CLEANUP_CRON_AFTER_RUN}`
     );
+    // PERGB-NFT-ENFORCE — a reboot clears the in-memory nft block set and
+    // respawns every 3proxy from cfg; re-assert the persisted pay-per-GB blocks
+    // so depleted accounts don't silently come back online until next topup.
+    accounting
+      .reapplyPergbBlocks()
+      .catch((err) =>
+        console.error(`[node-agent] reapplyPergbBlocks on boot failed: ${(err && err.message) || err}`)
+      );
   });
 }
 
