@@ -187,7 +187,143 @@ async function getCountersForPorts(ports) {
   return out;
 }
 
+// ── PERGB-NFT-ENFORCE — firewall-level pay-per-GB quota block ───────────────
+// disablePort/enablePort historically renamed the per-port 3proxy_<port>.cfg
+// and SIGKILLed its process. On block-config nodes only the block-START port
+// owns a per-port cfg; every mid-block port has none, so the old path was a
+// silent no-op (PORT_NOT_FOUND -> 404): a depleted pay-per-GB account kept
+// serving past quota (revenue leak) and the orchestrator looped re-enabling it
+// forever. We add enforcement that works for ANY port: one
+// `tcp dport @pergb_blocked drop` rule on the proxy_accounting input chain,
+// toggled by set membership. Validated live (block -> egress dies instantly,
+// unblock -> restored). Best-effort + idempotent; membership is persisted and
+// re-applied on boot (reapplyPergbBlocks) so a reboot can't silently un-block.
+const NFT_BLOCK_SET = "pergb_blocked";
+const HTTP_PORT_OFFSET = 10000; // paired http port = socks port - 10000
+const BLOCKED_LIST_FILE = path.join(PROXY_ROOT, "pergb_blocked.list");
+
+function _httpFor(portNum) {
+  const h = portNum - HTTP_PORT_OFFSET;
+  return h > 0 ? h : null;
+}
+
+function _readBlockedList() {
+  try {
+    return new Set(
+      fs
+        .readFileSync(BLOCKED_LIST_FILE, "utf-8")
+        .split(/\s+/)
+        .filter((s) => /^\d+$/.test(s))
+        .map(Number)
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function _writeBlockedList(set) {
+  try {
+    fs.writeFileSync(
+      BLOCKED_LIST_FILE,
+      [...set].sort((a, b) => a - b).join("\n") + "\n"
+    );
+  } catch (err) {
+    console.error(
+      `[accounting] failed to persist ${BLOCKED_LIST_FILE}: ${(err && err.message) || err}`
+    );
+  }
+}
+
+// Idempotently ensure our block set + the single drop rule sit on top of the
+// proxy_accounting input chain (the table/chain are created by the proxy
+// accounting setup; we only add our set + one rule).
+async function ensurePergbBlockInfra() {
+  await execCapture("nft", ["add", "table", "inet", NFT_TABLE]);
+  await execCapture("nft", [
+    "add", "chain", "inet", NFT_TABLE, "input",
+    "{", "type", "filter", "hook", "input", "priority", "filter", ";", "policy", "accept", ";", "}",
+  ]);
+  await execCapture("nft", [
+    "add", "set", "inet", NFT_TABLE, NFT_BLOCK_SET,
+    "{", "type", "inet_service", ";", "}",
+  ]);
+  const cur = await execCapture("nft", ["list", "chain", "inet", NFT_TABLE, "input"]);
+  if (!new RegExp("@" + NFT_BLOCK_SET + "[\\s\\S]*drop").test(cur.stdout || "")) {
+    await execCapture("nft", [
+      "insert", "rule", "inet", NFT_TABLE, "input",
+      "tcp", "dport", "@" + NFT_BLOCK_SET, "drop",
+    ]);
+  }
+}
+
+async function _nftSetElement(op, portNum) {
+  await execCapture("nft", [
+    op, "element", "inet", NFT_TABLE, NFT_BLOCK_SET, "{", String(portNum), "}",
+  ]);
+}
+
+// Apply (blocked=true) or lift (blocked=false) the firewall block for a port +
+// its paired http port. Best-effort: nft failures are logged, never thrown —
+// the orchestrator reconciles and reapplyPergbBlocks restores on boot.
+async function _enforceBlock(portNum, blocked) {
+  const http = _httpFor(portNum);
+  try {
+    await ensurePergbBlockInfra();
+    await _nftSetElement(blocked ? "add" : "delete", portNum);
+    if (http) await _nftSetElement(blocked ? "add" : "delete", http);
+  } catch (err) {
+    console.error(
+      `[accounting] nft ${blocked ? "block" : "unblock"} port ${portNum} failed: ${(err && err.message) || err}`
+    );
+  }
+  const list = _readBlockedList();
+  if (blocked) {
+    list.add(portNum);
+    if (http) list.add(http);
+  } else {
+    list.delete(portNum);
+    if (http) list.delete(http);
+  }
+  _writeBlockedList(list);
+}
+
+// Re-assert every persisted block. Call on agent startup: a reboot clears the
+// in-memory nft set and respawns all 3proxy from cfg, which would otherwise
+// silently un-block depleted pay-per-GB accounts.
+async function reapplyPergbBlocks() {
+  const list = _readBlockedList();
+  if (list.size === 0) return { reapplied: 0 };
+  try {
+    await ensurePergbBlockInfra();
+    for (const p of list) await _nftSetElement("add", p);
+  } catch (err) {
+    console.error(`[accounting] reapplyPergbBlocks failed: ${(err && err.message) || err}`);
+  }
+  console.log(`[accounting] reapplied ${list.size} pergb firewall block(s)`);
+  return { reapplied: list.size };
+}
+
+// Block a pay-per-GB port: firewall-drop it (works for every port, incl.
+// mid-block) THEN best-effort tear down its per-port cfg/process (block-START
+// ports). A missing per-port cfg is no longer an error — the nft drop is the
+// enforcement, so the account converges instead of 404-looping.
 async function disablePort(port) {
+  const portNum = Number(port);
+  if (!Number.isInteger(portNum) || portNum <= 0) {
+    throw new PortNotFoundError(port);
+  }
+  await _enforceBlock(portNum, true);
+  try {
+    return await _disablePortCfg(portNum);
+  } catch (err) {
+    if (err && err.code === "PORT_NOT_FOUND") {
+      return { action: "blocked_nft_only", port: portNum };
+    }
+    throw err;
+  }
+}
+
+async function _disablePortCfg(port) {
   const portNum = Number(port);
   if (!Number.isInteger(portNum) || portNum <= 0) {
     throw new PortNotFoundError(port);
@@ -279,7 +415,26 @@ async function disablePort(port) {
   return { action: "killed", pids };
 }
 
+// Unblock a pay-per-GB port: lift the firewall drop THEN best-effort re-spawn
+// its per-port cfg (block-START ports). A missing per-port cfg is no longer an
+// error — lifting the nft drop is what restores a mid-block port.
 async function enablePort(port) {
+  const portNum = Number(port);
+  if (!Number.isInteger(portNum) || portNum <= 0) {
+    throw new PortNotFoundError(port);
+  }
+  await _enforceBlock(portNum, false);
+  try {
+    return await _enablePortCfg(portNum);
+  } catch (err) {
+    if (err && err.code === "PORT_NOT_FOUND") {
+      return { action: "unblocked_nft_only", port: portNum };
+    }
+    throw err;
+  }
+}
+
+async function _enablePortCfg(port) {
   const portNum = Number(port);
   if (!Number.isInteger(portNum) || portNum <= 0) {
     throw new PortNotFoundError(port);
@@ -338,4 +493,14 @@ module.exports = {
   configPathForPort,
   disabledConfigPathForPort,
   _demoteCfg,
+  // PERGB-NFT-ENFORCE — firewall block lifecycle (agent-startup reapply hook +
+  // exported for unit tests).
+  reapplyPergbBlocks,
+  ensurePergbBlockInfra,
+  _enforceBlock,
+  _readBlockedList,
+  _writeBlockedList,
+  _httpFor,
+  BLOCKED_LIST_FILE,
+  NFT_BLOCK_SET,
 };
