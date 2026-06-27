@@ -765,13 +765,22 @@ function generate_ipv6_addresses_if_needed() {
     echo ;
   }
   
+  # Wave PERGB-IPV6-FAST: the legacy uniqueness check ran `ip -6 addr show | grep`
+  # (O(addresses-on-interface)) for EVERY candidate. With thousands of addresses
+  # already bound (a node full of pay-per-GB ports), that is O(N^2) and the
+  # generation job timed out partway -> an incomplete IPv6 list ("No IPv6 address
+  # for port X"), a broken proxies.list, and a wedged genlock. Snapshot the
+  # existing addresses into an associative array ONCE, then check membership O(1).
+  declare -A _ip6seen
+  while read -r _a; do [ -n "$_a" ] && _ip6seen[$_a]=1; done < <(ip -6 addr show 2>/dev/null | grep -oE 'inet6 [0-9a-f:]+' | sed -E 's/inet6 //')
   count=1
   while [ "$count" -le $proxy_count ]; do
-    # Generate unique IPv6 - check it's not already in use
+    # Generate unique IPv6 - check it's not already in use (O(1) set lookup)
     new_ipv6=$(rnd_subnet_ip)
-    while ip -6 addr show 2>/dev/null | grep -q "$new_ipv6" || grep -q "$new_ipv6" "$random_ipv6_list_file" 2>/dev/null; do
+    while [ -n "${_ip6seen[$new_ipv6]:-}" ]; do
       new_ipv6=$(rnd_subnet_ip)
     done
+    _ip6seen[$new_ipv6]=1
     echo "$new_ipv6" >> $random_ipv6_list_file;
     ((count+=1))
   done
@@ -1080,6 +1089,17 @@ function setup_nftables_counters() {
      echo "   РІСљвЂ¦ Table priority check passed"
   fi
   
+  # Wave PERGB-METER-MAP: O(1) per-packet accounting. The legacy path added one
+  # linear chain rule per port (`tcp dport <port> counter ...`), so EVERY packet
+  # scanned up to N rules -> at ~5k ports the node collapsed under real traffic.
+  # Replace that with ONE rule per chain that selects the per-port counter through
+  # a map (single hash lookup, O(1) regardless of port count). Maps + the two
+  # map-rules are ensured once here; the per-port loop below only adds map ELEMENTS.
+  nft add map inet proxy_accounting cmap_in  '{ type inet_service : counter ; }' 2>/dev/null || true
+  nft add map inet proxy_accounting cmap_out '{ type inet_service : counter ; }' 2>/dev/null || true
+  nft list chain inet proxy_accounting input  2>/dev/null | grep -q 'map @cmap_in'  || nft add rule inet proxy_accounting input  counter name tcp dport map @cmap_in
+  nft list chain inet proxy_accounting output 2>/dev/null | grep -q 'map @cmap_out' || nft add rule inet proxy_accounting output counter name tcp sport map @cmap_out
+
   echo "   Adding counter rules for $proxy_count proxies..."
   
   # Read IPv6 addresses from the list file
@@ -1126,36 +1146,45 @@ function setup_nftables_counters() {
       while nft delete rule inet proxy_accounting input  tcp dport "$http_port" 2>/dev/null; do :; done
       while nft delete rule inet proxy_accounting output tcp sport "$http_port" 2>/dev/null; do :; done
     fi
-    nft delete counter inet proxy_accounting "proxy_${port}_in"  2>/dev/null || true
-    nft delete counter inet proxy_accounting "proxy_${port}_out" 2>/dev/null || true
+    # Wave PERGB-METER-MAP: NEVER delete the counters on re-account -> their
+    # cumulative byte values (billing) must survive. Drop only the old map elements
+    # so the re-add below is a clean, value-safe swap.
+    nft delete element inet proxy_accounting cmap_in  "{ $port }" 2>/dev/null || true
+    nft delete element inet proxy_accounting cmap_out "{ $port }" 2>/dev/null || true
+    if [ "$proxies_type" = "dual" ]; then
+      nft delete element inet proxy_accounting cmap_in  "{ $http_port }" 2>/dev/null || true
+      nft delete element inet proxy_accounting cmap_out "{ $http_port }" 2>/dev/null || true
+    fi
 
-    # Two named counters per port.
+    # Two named counters per port (idempotent -> value preserved on re-account).
     nft add counter inet proxy_accounting "proxy_${port}_in"  2>/dev/null || true
     nft add counter inet proxy_accounting "proxy_${port}_out" 2>/dev/null || true
     
-    # Client upload: client -> proxy (input tcp dport <port>). In an inet table this
-    # bare tcp-dport rule counts BOTH IPv4 and IPv6 clients.
-    local err_msg=$(nft add rule inet proxy_accounting input tcp dport "$port" counter name "proxy_${port}_in" comment "proxy_${port}_in" 2>&1)
+    # Wave PERGB-METER-MAP: register port -> counter in the maps. The chain's single
+    # map-rule then bills every packet via an O(1) hash lookup (was an O(N) linear
+    # per-port rule scan that collapsed the node at scale). A bare port match in an
+    # inet table counts BOTH IPv4 and IPv6 clients.
+    #   proxy_<port>_in  = client -> proxy  (upload)
+    #   proxy_<port>_out = proxy  -> client (DOWNLOAD = BILLABLE)
+    local err_msg=$(nft add element inet proxy_accounting cmap_in "{ $port : \"proxy_${port}_in\" }" 2>&1)
     if [ $? -eq 0 ]; then
       added_count=$((added_count + 1))
     else
-      echo "   [ERR] Failed IN rule for port $port: $err_msg"
+      echo "   [ERR] Failed IN element for port $port: $err_msg"
       failed_count=$((failed_count + 1))
     fi
 
-    # Download = BILLABLE: proxy -> client (output tcp sport <port>), both families.
-    # This is the byte volume the customer paid GBs for, independent of egress family/address.
-    err_msg=$(nft add rule inet proxy_accounting output tcp sport "$port" counter name "proxy_${port}_out" comment "proxy_${port}_out" 2>&1)
+    err_msg=$(nft add element inet proxy_accounting cmap_out "{ $port : \"proxy_${port}_out\" }" 2>&1)
     if [ $? -ne 0 ]; then
-      echo "   [ERR] Failed OUT rule for port $port: $err_msg"
+      echo "   [ERR] Failed OUT element for port $port: $err_msg"
       failed_count=$((failed_count + 1))
     fi
 
     # DUAL: fold the paired http listener (socks port - 10000) into the SAME counters,
     # so http-proxy traffic bills the same pool (http port is not its own polled row).
     if [ "$proxies_type" = "dual" ]; then
-      nft add rule inet proxy_accounting input  tcp dport "$http_port" counter name "proxy_${port}_in"  comment "proxy_${port}_in_http"  2>/dev/null || true
-      nft add rule inet proxy_accounting output tcp sport "$http_port" counter name "proxy_${port}_out" comment "proxy_${port}_out_http" 2>/dev/null || true
+      nft add element inet proxy_accounting cmap_in  "{ $http_port : \"proxy_${port}_in\" }"  2>/dev/null || true
+      nft add element inet proxy_accounting cmap_out "{ $http_port : \"proxy_${port}_out\" }" 2>/dev/null || true
     fi
     
     # Show progress every 100

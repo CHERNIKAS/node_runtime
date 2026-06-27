@@ -134,14 +134,27 @@ async function findRunningPids(port) {
   throw new ProcessSpawnError("pgrep_failed", result.stderr || `exit ${result.code}`);
 }
 
-async function getCountersForPorts(ports) {
-  const requested = new Set(
-    (ports || [])
-      .map((p) => Number(p))
-      .filter((p) => Number.isInteger(p) && p > 0)
-  );
-  if (requested.size === 0) return {};
+// Wave PERGB-METER-CACHE — collapse the per-cycle dump storm. The orchestrator
+// polls /accounting in 100-port chunks, so ONE poll cycle of a ~5k-port node
+// fires ~50 separate getCountersForPorts() calls, each previously running a
+// full `nft -j list counters table` dump (~1.1s at 12k counters) — i.e. ~50
+// dumps per cycle, which pinned a CPU core continuously. A targeted per-counter
+// read via `nft -f` is actually SLOWER (per-statement overhead — measured), so
+// we keep the single bulk dump but CACHE it across the chunks of one cycle.
+// Cycles are delimited by the request GAP: chunks arrive back-to-back while the
+// next cycle is >=1 poll interval later, so a gap longer than
+// COUNTERS_CACHE_GAP_MS forces a fresh dump. That makes cross-cycle reuse (which
+// would zero a cycle's deltas) impossible regardless of the poll interval.
+// Concurrent chunks coalesce onto one in-flight dump. Billing-safe: every chunk
+// in a cycle reads ONE consistent counter snapshot and the orchestrator's
+// per-port delta math is unchanged.
+const COUNTERS_CACHE_GAP_MS = Number(process.env.NODE_AGENT_COUNTERS_CACHE_GAP_MS || 2000);
+const COUNTERS_CACHE_MAX_MS = Number(process.env.NODE_AGENT_COUNTERS_CACHE_MAX_MS || 8000);
+let _countersCache = { at: 0, items: null };
+let _countersInFlight = null;
+let _lastCounterReqAt = 0;
 
+async function _fetchAllCounterItems() {
   const result = await execCapture("nft", ["-j", "list", "counters", "table", "inet", NFT_TABLE]);
   if (result.code !== 0) {
     throw new NftablesError("nft_list_counters_failed", result.stderr || `exit ${result.code}`);
@@ -152,7 +165,53 @@ async function getCountersForPorts(ports) {
   } catch (err) {
     throw new NftablesError("nft_json_parse_failed", String(err && err.message || err));
   }
-  const items = Array.isArray(parsed && parsed.nftables) ? parsed.nftables : [];
+  return Array.isArray(parsed && parsed.nftables) ? parsed.nftables : [];
+}
+
+// Overridable fetcher seam for unit tests (default = real nft dump).
+let _counterItemsFetcher = _fetchAllCounterItems;
+
+async function _getCachedCounterItems() {
+  const now = Date.now();
+  const newCycle = now - _lastCounterReqAt > COUNTERS_CACHE_GAP_MS;
+  _lastCounterReqAt = now;
+  const fresh =
+    !newCycle &&
+    _countersCache.items !== null &&
+    now - _countersCache.at < COUNTERS_CACHE_MAX_MS;
+  if (fresh) return _countersCache.items;
+  if (_countersInFlight) return _countersInFlight;
+  _countersInFlight = (async () => {
+    try {
+      const items = await _counterItemsFetcher();
+      _countersCache = { at: Date.now(), items };
+      return items;
+    } finally {
+      _countersInFlight = null;
+    }
+  })();
+  return _countersInFlight;
+}
+
+// Test seam (Wave PERGB-METER-CACHE).
+function _resetCountersCache() {
+  _countersCache = { at: 0, items: null };
+  _countersInFlight = null;
+  _lastCounterReqAt = 0;
+}
+function _setCounterItemsFetcher(fn) {
+  _counterItemsFetcher = typeof fn === "function" ? fn : _fetchAllCounterItems;
+}
+
+async function getCountersForPorts(ports) {
+  const requested = new Set(
+    (ports || [])
+      .map((p) => Number(p))
+      .filter((p) => Number.isInteger(p) && p > 0)
+  );
+  if (requested.size === 0) return {};
+
+  const items = await _getCachedCounterItems();
 
   const buckets = new Map();
   for (const item of items) {
@@ -237,7 +296,19 @@ function _writeBlockedList(set) {
 // Idempotently ensure our block set + the single drop rule sit on top of the
 // proxy_accounting input chain (the table/chain are created by the proxy
 // accounting setup; we only add our set + one rule).
+// Wave PERGB-METER-CACHE — the block-drop rule + chain/set/table are static for
+// a process lifetime: once present they persist until an nftables flush (reboot
+// -> agent restart -> this flag resets). The old code re-listed the ENTIRE input
+// chain (~38k rules at 5k ports) on EVERY _enforceBlock call just to regex-check
+// the one drop rule, and a block/unblock storm turned that O(ruleset) scan into a
+// continuous CPU sink. Ensure once per process, then skip the expensive
+// `nft list chain`. The flag latches only once the drop rule is confirmed present
+// (or freshly inserted ok), so a transient insert failure is retried next call.
+// Set membership (which ports are blocked) is managed separately and NOT gated,
+// so enforcement stays correct.
+let _blockInfraEnsured = false;
 async function ensurePergbBlockInfra() {
+  if (_blockInfraEnsured) return;
   await execCapture("nft", ["add", "table", "inet", NFT_TABLE]);
   await execCapture("nft", [
     "add", "chain", "inet", NFT_TABLE, "input",
@@ -248,12 +319,15 @@ async function ensurePergbBlockInfra() {
     "{", "type", "inet_service", ";", "}",
   ]);
   const cur = await execCapture("nft", ["list", "chain", "inet", NFT_TABLE, "input"]);
-  if (!new RegExp("@" + NFT_BLOCK_SET + "[\\s\\S]*drop").test(cur.stdout || "")) {
-    await execCapture("nft", [
-      "insert", "rule", "inet", NFT_TABLE, "input",
-      "tcp", "dport", "@" + NFT_BLOCK_SET, "drop",
-    ]);
+  if (new RegExp("@" + NFT_BLOCK_SET + "[\\s\\S]*drop").test(cur.stdout || "")) {
+    _blockInfraEnsured = true;
+    return;
   }
+  const ins = await execCapture("nft", [
+    "insert", "rule", "inet", NFT_TABLE, "input",
+    "tcp", "dport", "@" + NFT_BLOCK_SET, "drop",
+  ]);
+  if (ins.code === 0) _blockInfraEnsured = true;
 }
 
 async function _nftSetElement(op, portNum) {
