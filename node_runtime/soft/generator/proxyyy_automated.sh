@@ -1111,6 +1111,44 @@ function setup_nftables_counters() {
   readarray -t ipv6_addresses < "$random_ipv6_list_file"
   local added_count=0
   local failed_count=0
+
+  # PERGB-NFT-BATCH (2026-06-27): the per-port loop below spawns ~10 nft
+  # processes per port (~5000 for 500 ports = minutes at 100% CPU). On a small
+  # node that starves the box mid-generation -> the orchestrator can't reach it
+  # (node_unavailable) and the freshly-spawned 3proxy binds its 500 listeners too
+  # slowly (ports_not_listening). For a FRESH range, collect every add into ONE
+  # atomic `nft -f` (single process, ~1s). Re-account / partial ranges make an add
+  # collide so the batch aborts atomically -> we fall through to the robust
+  # per-port path below (which deletes-then-adds, preserving counter values).
+  local _bok=1 _batch_file
+  _batch_file=$(mktemp 2>/dev/null) || _batch_file=""
+  if [ -n "$_batch_file" ]; then
+    {
+      for ((i=0; i<proxy_count; i++)); do
+        local _p=$((start_port + i))
+        if [ -z "${ipv6_addresses[$i]}" ]; then _bok=0; break; fi
+        echo "add counter inet proxy_accounting proxy_${_p}_in"
+        echo "add counter inet proxy_accounting proxy_${_p}_out"
+        echo "add element inet proxy_accounting cmap_in { ${_p} : \"proxy_${_p}_in\" }"
+        echo "add element inet proxy_accounting cmap_out { ${_p} : \"proxy_${_p}_out\" }"
+        if [ "$proxies_type" = "dual" ]; then
+          local _hp=$((_p - 10000))
+          echo "add element inet proxy_accounting cmap_in { ${_hp} : \"proxy_${_p}_in\" }"
+          echo "add element inet proxy_accounting cmap_out { ${_hp} : \"proxy_${_p}_out\" }"
+        fi
+      done
+    } > "$_batch_file"
+    if [ "$_bok" = "1" ] && nft -f "$_batch_file" 2>/dev/null; then
+      added_count=$proxy_count
+      rm -f "$_batch_file"
+      echo "   [PROGRESS] Setup $proxy_count/$proxy_count counters (fast batch)..."
+      echo "   Setup $added_count nftables counters (client-port based, batched)"
+      echo "   Saving nftables rules for persistence..."
+      nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+      return 0
+    fi
+    rm -f "$_batch_file"
+  fi
   
   for ((i=0; i<proxy_count; i++)); do
     local port=$((start_port + i))

@@ -27,6 +27,7 @@ const STALE_LOCK_MS = Math.max(60_000, Number(process.env.NODE_AGENT_STALE_LOCK_
 const DEFAULT_AUTH_CHECK_SAMPLES = Math.max(1, Number(process.env.NODE_AGENT_AUTH_CHECK_SAMPLES || 3));
 const DEFAULT_AUTH_CHECK_TIMEOUT_MS = Math.max(1000, Number(process.env.NODE_AGENT_AUTH_CHECK_TIMEOUT_MS || 5000));
 const DEFAULT_INSTANCE_WAIT_MS = Math.max(2000, Number(process.env.NODE_AGENT_INSTANCE_WAIT_MS || 12000));
+const DEFAULT_PORTS_LISTEN_WAIT_MS = Math.max(12000, Number(process.env.NODE_AGENT_PORTS_LISTEN_WAIT_MS || 90000));
 const DEFAULT_IPV6_EGRESS_URL = String(process.env.NODE_AGENT_IPV6_EGRESS_URL || "https://api64.ipify.org").trim();
 const PROXY_ROOT = path.normalize(process.env.NODE_AGENT_PROXY_ROOT || "/opt/netrun/proxyserver");
 const PROXY_CFG_ROOT = path.join(PROXY_ROOT, "3proxy");
@@ -1021,12 +1022,12 @@ async function killOverlappingListeners({ newStart, newCount }) {
   // Live kernel view: prefer -H (no header); fall back to header-bearing form.
   let ssText = "";
   let ssOk = false;
-  const ssH = await runCommand("ss", ["-tlnpH"], { timeoutSec: 8 });
+  const ssH = await runCommand("ss", ["-tlnpH", `sport >= :${targetRangeLow} and sport <= :${targetRangeHigh}`], { timeoutSec: 8 });
   if (ssH.ok) {
     ssText = String(ssH.stdout || "");
     ssOk = true;
   } else {
-    const ssPlain = await runCommand("ss", ["-tlnp"], { timeoutSec: 8 });
+    const ssPlain = await runCommand("ss", ["-tlnp", `sport >= :${targetRangeLow} and sport <= :${targetRangeHigh}`], { timeoutSec: 8 });
     if (ssPlain.ok) {
       // Drop the header line (the only line containing "Local Address").
       ssText = String(ssPlain.stdout || "")
@@ -1211,9 +1212,17 @@ function computeProxyReadiness(instances, listeningPorts, portsOk = true) {
   };
 }
 
-async function listListeningTcpPorts() {
+async function listListeningTcpPorts(range) {
   const out = new Set();
-  const ss = await runCommand("ss", ["-ltnH"], { timeoutSec: 8 });
+  // PERGB-SS-SCOPE: with thousands of listeners the full `ss` dump exceeds
+  // runCommand's 500KB tail cap -> truncated output makes live ports read as
+  // "not listening" (false ports_not_listening; kill-on-rebind misses daemons).
+  // Filter to the caller's range in-kernel so the output stays small + complete.
+  const _ssArgs = ["-ltnH"];
+  if (range && Number.isInteger(range.low) && Number.isInteger(range.high) && range.low > 0 && range.high >= range.low) {
+    _ssArgs.push(`sport >= :${range.low} and sport <= :${range.high}`);
+  }
+  const ss = await runCommand("ss", _ssArgs, { timeoutSec: 8 });
   if (!ss.ok) {
     return { ok: false, error: ss.error || "ss_failed", ports: out };
   }
@@ -2255,17 +2264,30 @@ async function validateGenerationOutput({
   checks.instance_running = true;
   checks.no_duplicate_instance = true;
 
-  const listening = await listListeningTcpPorts();
-  if (!listening.ok) {
-    return {
-      ok: false,
-      error: "listening_probe_failed",
-      checks,
-      details: { ...details, listeningProbeError: listening.error },
-    };
-  }
+  // PERGB-LISTEN-POLL: a freshly spawned 3proxy binds its 500 listeners over
+  // time (can exceed the 12s instance-wait under load). The old one-shot probe
+  // ran the instant the *process* appeared and raced the bind -> a false
+  // ports_not_listening; the block then finished binding and became an untracked
+  // ghost that later collided with the port allocator. Poll the listening set
+  // until every expected port is up or a deadline.
   const expectedPorts = makeExpectedPorts(startPort, proxyCount);
-  const missingPorts = expectedPorts.filter((p) => !listening.ports.has(p));
+  let missingPorts = expectedPorts;
+  let listening = { ok: false, error: "listening_probe_not_run", ports: new Set() };
+  const listenDeadline = Date.now() + DEFAULT_PORTS_LISTEN_WAIT_MS;
+  for (;;) {
+    listening = await listListeningTcpPorts({ low: startPort, high: startPort + proxyCount - 1 });
+    if (!listening.ok) {
+      return {
+        ok: false,
+        error: "listening_probe_failed",
+        checks,
+        details: { ...details, listeningProbeError: listening.error },
+      };
+    }
+    missingPorts = expectedPorts.filter((p) => !listening.ports.has(p));
+    if (missingPorts.length === 0 || Date.now() >= listenDeadline) break;
+    await sleep(1000);
+  }
   if (missingPorts.length > 0) {
     return {
       ok: false,
