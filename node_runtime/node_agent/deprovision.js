@@ -279,7 +279,17 @@ async function deprovisionPorts(rawPorts) {
         await killCfgProcess(startPort);
         safeUnlink(cfgPath);
         safeUnlink(cfgPath + ".disabled");
+        // Drop ALL of the generator's per-start-port state for this instance,
+        // not just the cfg. The generator keys these files by instance_id =
+        // start_port (proxyyy_automated.sh): a stale/partial ipv6_<port>.list
+        // (or users list) left behind makes the NEXT generate at this start_port
+        // REUSE it and emit an inconsistent batch — proxies.list has N entries
+        // but the cfg/map only 1 port, so the node-agent hangs forever waiting
+        // for N listeners to come up (observed on the 2026-06-30 recovery node).
         safeUnlink(path.join(PROXY_ROOT, `proxy-startup_${startPort}.sh`));
+        safeUnlink(path.join(PROXY_ROOT, `ipv6_${startPort}.list`));
+        safeUnlink(path.join(PROXY_ROOT, `random_users_${startPort}.list`));
+        safeUnlink(path.join(PROXY_ROOT, `running_server_${startPort}.info`));
       } else {
         // Rewrite atomically: header + surviving blocks → temp → fsync rename.
         const body = plan.newText;
