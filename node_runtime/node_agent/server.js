@@ -9,6 +9,7 @@ const dns = require("dns");
 const { buildDescribe } = require("./describe.js");
 const accounting = require("./accounting.js");
 const egressMode = require("./egress_mode.js");
+const deprovision = require("./deprovision.js");
 
 const PORT = Number(process.env.NODE_AGENT_PORT || 8085);
 const API_KEY = String(process.env.NODE_AGENT_API_KEY || "").trim();
@@ -3413,6 +3414,55 @@ const server = http.createServer(async (req, res) => {
         success: false,
         ok: false,
         error: "egress_mode_failed",
+        detail: String((err && err.message) || err),
+      });
+    }
+  }
+
+  // Wave NODE-DEPROVISION — remove a flat list of socks ports' footprint
+  // (3proxy listener + per-port cfg block + nft accounting rules/counters) from
+  // this node. The ORCHESTRATOR guarantees the list contains NO customer-held
+  // port (it owns the DB); this handler is a dumb idempotent executor — it drops
+  // whole cfgs that become empty and REWRITES mixed cfgs keeping the survivors
+  // (kept ports, incl. customers in a mixed batch, take a brief reconnect blip).
+  if (req.method === "POST" && pathname === "/deprovision") {
+    if (!ensureAuthorized(req)) {
+      return sendJson(res, 401, { success: false, error: "unauthorized" });
+    }
+    let body;
+    try {
+      body = await parseJsonBody(req);
+    } catch (err) {
+      return sendJson(res, 400, {
+        success: false,
+        error: "invalid_json",
+        detail: String((err && err.message) || err),
+      });
+    }
+    const ports = Array.isArray(body && body.ports) ? body.ports : null;
+    if (!ports) {
+      return sendJson(res, 400, {
+        success: false,
+        error: "missing_ports",
+        detail: "body must be { ports: [int, ...] }",
+      });
+    }
+    // Cap per call so each request stays bounded (the orchestrator chunks by
+    // batch anyway — typically one cfg's worth of ports per call).
+    if (ports.length > 1000) {
+      return sendJson(res, 400, {
+        success: false,
+        error: "too_many_ports",
+        detail: "max 1000 ports per call",
+      });
+    }
+    try {
+      const result = await deprovision.deprovisionPorts(ports);
+      return sendJson(res, 200, { success: result.ok, ...result });
+    } catch (err) {
+      return sendJson(res, 500, {
+        success: false,
+        error: "deprovision_failed",
         detail: String((err && err.message) || err),
       });
     }
